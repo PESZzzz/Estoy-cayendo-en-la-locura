@@ -1,29 +1,26 @@
 """
 Hunyuan3D 2 Mini (GGUF) — Extension setup script for Modly.
+Streamlined build: Uses custom GitHub patched code + Direct HF vision downloader
++ Auto-organizes models in Documents/Modly/models/hunyuan3d-v2-gguf.
 """
 
-import io
 import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
-import urllib.request
-import zipfile
 from pathlib import Path
 
 # ------------------------------------------------------------------ #
 # Constantes y Parámetros
 # ------------------------------------------------------------------ #
 EXTENSION_NAME = "hunyuan3d-v2-gguf"
-HUNYUAN_GITHUB_ZIP = "https://github.com/Tencent/Hunyuan3D-2/archive/refs/heads/main.zip"
 
-FILES_TO_REPLACE = [
-    "pipelines.py",
-    "surface_extractors.py",
-    "volume_decoders.py",
-]
+# Origen del vision safetensors pesado (~2.47 GB)
+CALCUIS_REPO_ID = "calcuis/hunyuan3d-v2-gguf"
+VISION_FILE_NAME = "hy-3d-vision.safetensors"
+TARGET_SUBFOLDER = Path("generate") / "hunyuan3d-dit-v2-0"
 
 PACKAGES = [
     "torch",
@@ -62,56 +59,55 @@ def pip(venv: Path, *args: str) -> None:
     subprocess.run([str(python_exe), "-m", "pip", *args], check=True)
 
 
-def download_hy3dgen_source(generate_dir: Path) -> None:
-    """Descarga y extrae la estructura base de hy3dgen dentro de generate/_hy3dgen."""
-    target_hy3dgen = generate_dir / "_hy3dgen"
-    if (target_hy3dgen / "hy3dgen").exists():
-        log("El módulo _hy3dgen ya existe dentro de 'generate'.")
+def download_vision_model(ext_dir: Path, venv: Path) -> None:
+    """Descarga el hy-3d-vision.safetensors dentro de generate/hunyuan3d-dit-v2-0."""
+    target_dir = ext_dir / TARGET_SUBFOLDER
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_file = target_dir / VISION_FILE_NAME
+
+    if target_file.exists():
+        log(f"El archivo vision safetensors ya está presente en: {target_file}")
         return
 
-    log("Descargando código fuente de hy3dgen desde GitHub...")
-    target_hy3dgen.mkdir(parents=True, exist_ok=True)
+    log(f"Descargando {VISION_FILE_NAME} desde Hugging Face ({CALCUIS_REPO_ID})...")
+    python_venv = get_python(venv)
 
-    with urllib.request.urlopen(HUNYUAN_GITHUB_ZIP, timeout=180) as resp:
-        data = resp.read()
+    download_script = (
+        f"from huggingface_hub import hf_hub_download\n"
+        f"hf_hub_download("
+        f"repo_id='{CALCUIS_REPO_ID}', "
+        f"filename='{VISION_FILE_NAME}', "
+        f"local_dir=r'{target_dir}', "
+        f"local_dir_use_symlinks=False)\n"
+    )
 
-    log("Extrayendo hy3dgen dentro de generate/_hy3dgen...")
-    prefix = "Hunyuan3D-2-main/hy3dgen/"
-    strip = "Hunyuan3D-2-main/"
-
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        for member in zf.namelist():
-            if not member.startswith(prefix):
-                continue
-            rel = member[len(strip):]
-            target = target_hy3dgen / rel
-            if member.endswith("/"):
-                target.mkdir(parents=True, exist_ok=True)
-            else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(zf.read(member))
-
-    log(f"hy3dgen configurado correctamente en: {target_hy3dgen}")
+    subprocess.run([str(python_venv), "-c", download_script], check=True)
+    log(f"Descarga de {VISION_FILE_NAME} completada exitosamente en {target_dir}.")
 
 
-def replace_custom_files(ext_dir: Path, generate_dir: Path) -> None:
-    """Copia y reemplaza los parches personalizados en generate/_hy3dgen/hy3dgen/shapegen."""
-    target_dir = generate_dir / "_hy3dgen" / "hy3dgen" / "shapegen"
-    
-    if not target_dir.exists():
-        log(f"Aviso: La ruta destino {target_dir} aún no existe.")
+def sync_to_modly_models(ext_dir: Path) -> None:
+    """Asegura que la carpeta generate/ quede ubicada en Documents/Modly/models/hunyuan3d-v2-gguf."""
+    modly_models_dir = Path.home() / "Documents" / "Modly" / "models" / EXTENSION_NAME
+    local_generate = ext_dir / "generate"
+
+    if not local_generate.exists():
+        log(f"Aviso: No se encontró la carpeta 'generate' local en {local_generate}")
         return
 
-    log("Aplicando parches personalizados GGUF en hy3dgen/shapegen...")
-    for filename in FILES_TO_REPLACE:
-        src_file = ext_dir / filename
-        dst_file = target_dir / filename
+    log(f"Configurando directorio de modelos en: {modly_models_dir}")
+    modly_models_dir.mkdir(parents=True, exist_ok=True)
 
-        if src_file.exists():
-            shutil.copy2(src_file, dst_file)
-            log(f"Reemplazado: {filename} -> {dst_file}")
-        else:
-            log(f"Aviso: No se encontró el parche local {src_file}")
+    target_generate = modly_models_dir / "generate"
+
+    # Si la carpeta destino ya existe, sincronizamos/copiamos el contenido
+    if target_generate.exists():
+        log("La carpeta 'generate' ya existe en Modly models. Actualizando contenido...")
+        shutil.copytree(local_generate, target_generate, dirs_exist_ok=True)
+    else:
+        log("Moviendo estructura 'generate' a Modly models...")
+        shutil.move(str(local_generate), str(target_generate))
+
+    log("Directorio de modelos sincronizado con éxito.")
 
 
 def setup(
@@ -129,20 +125,13 @@ def setup(
     log(f"Creando entorno virtual (venv) en {venv}...")
     subprocess.run([python_exe, "-m", "venv", str(venv)], check=True)
 
-    # ------------------------------------------------------------------ #
-    # Instalación de dependencias de Python
-    # ------------------------------------------------------------------ #
-    log("Instalando dependencias necesarias (PyTorch, Pillow, GGUF, etc.)...")
-    
-    # Usamos python -m pip para evitar que Windows bloquee pip.exe al actualizar
+    # 1. Instalación de dependencias
+    log("Instalando dependencias de Python...")
     python_venv = get_python(venv)
     subprocess.run([str(python_venv), "-m", "pip", "install", "--upgrade", "pip"], check=True)
-    
     pip(venv, "install", *PACKAGES)
 
-    # ------------------------------------------------------------------ #
-    # Enlace .pth para resolver importaciones
-    # ------------------------------------------------------------------ #
+    # 2. Enlace .pth
     log("Vinculando la extensión al entorno Python (.pth)...")
     try:
         is_win = platform.system() == "Windows"
@@ -158,16 +147,13 @@ def setup(
     except Exception as e:
         log(f"Aviso al crear el enlace .pth: {e}")
 
-    # ------------------------------------------------------------------ #
-    # Preparación de estructura hy3dgen local
-    # ------------------------------------------------------------------ #
-    generate_dir = ext_dir / "generate"
-    generate_dir.mkdir(parents=True, exist_ok=True)
+    # 3. Descargar el vision safetensors a generate/
+    download_vision_model(ext_dir, venv)
 
-    download_hy3dgen_source(generate_dir)
-    replace_custom_files(ext_dir, generate_dir)
+    # 4. Mover/Sincronizar 'generate' a Documents/Modly/models/hunyuan3d-v2-gguf
+    sync_to_modly_models(ext_dir)
 
-    log("¡Setup finalizado con éxito! Entorno listo para Modly.")
+    log("¡Setup finalizado con éxito! La extensión y sus modelos están en su lugar.")
 
 
 if __name__ == "__main__":
@@ -184,8 +170,8 @@ if __name__ == "__main__":
         setup(
             python_exe=args["python_exe"],
             ext_dir=Path(args["ext_dir"]),
-            gpu_sm=int(args.get("gpu_sm", 0)),
-            cuda_version=int(args.get("cuda_version", 0)),
+            gpu_sm=args.get("gpu_sm", 0),
+            cuda_version=args.get("cuda_version", 0),
             torch_flavor=args.get("torch_flavor", "cuda"),
             accelerator=args.get("accelerator", ""),
             platform_name=args.get("platform", ""),
