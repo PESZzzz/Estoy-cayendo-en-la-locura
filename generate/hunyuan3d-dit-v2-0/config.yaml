@@ -8,7 +8,7 @@ model:
     num_heads: 16
     depth: 16
     depth_single_blocks: 32
-    axes_dim: [ 64 ]
+    axes_dim: [ 12, 12, 12 ]
     theta: 10000
     qkv_bias: True
 
