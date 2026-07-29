@@ -1,0 +1,107 @@
+{
+  "id": "hunyuan3d-v2-gguf",
+  "name": "Hunyuan3D 2 (GGUF Q4)",
+  "type": "model",
+  "source": "https://github.com/PESZzzz/Estoy-cayendo-en-la-locura",
+  "description": "Custom Hunyuan3D v2 pipeline powered by calcuis GGUF Q4_K_M quantization. Optimized for low VRAM usage.",
+  "version": "1.0.0",
+  "author": "Modly Community",
+  "generator_class": "Hunyuan3DGGUFGenerator",
+  "tags": [
+    "image-to-3d",
+    "gguf",
+    "amd-friendly",
+    "low-vram"
+  ],
+  "nodes": [
+    {
+      "id": "generate",
+      "name": "Generate Mesh (GGUF)",
+      "label": "Generate Mesh (GGUF)",
+      "type": "generator",
+      "input": "image",
+      "output": "mesh",
+      "download_check": "hunyuan3d-dit-v2-0",
+      "params_schema": [
+        {
+          "id": "num_inference_steps",
+          "label": "Quality",
+          "type": "select",
+          "default": 30,
+          "options": [
+            {
+              "value": 10,
+              "label": "Fast"
+            },
+            {
+              "value": 30,
+              "label": "Balanced"
+            },
+            {
+              "value": 50,
+              "label": "High"
+            }
+          ],
+          "tooltip": "Number of diffusion steps."
+        },
+        {
+          "id": "octree_resolution",
+          "label": "Mesh Resolution",
+          "type": "select",
+          "default": 384,
+          "options": [
+            {
+              "value": 256,
+              "label": "Low (256)"
+            },
+            {
+              "value": 384,
+              "label": "Medium (384)"
+            },
+            {
+              "value": 512,
+              "label": "High (512)"
+            }
+          ],
+          "tooltip": "Octree resolution for mesh reconstruction."
+        },
+        {
+          "id": "enable_texture",
+          "label": "Generate Texture",
+          "type": "boolean",
+          "default": false,
+          "tooltip": "Run the Hunyuan3D Paint pipeline after mesh extraction to apply textures."
+        },
+        {
+          "id": "vertex_count",
+          "label": "Max Vertices (Decimation)",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 500000,
+          "step": 1000,
+          "tooltip": "Target vertex count to simplify the mesh. Set to 0 to disable decimation."
+        },
+        {
+          "id": "guidance_scale",
+          "label": "Guidance Scale",
+          "type": "float",
+          "default": 5.5,
+          "min": 1.0,
+          "max": 10.0,
+          "step": 0.5,
+          "tooltip": "Classifier-free guidance strength."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 2147483647,
+          "tooltip": "Seed for reproducibility (-1 for random)."
+        }
+      ]
+    }
+  ]
+}
