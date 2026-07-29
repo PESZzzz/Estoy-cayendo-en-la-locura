@@ -17,8 +17,8 @@ from pathlib import Path
 # ------------------------------------------------------------------ #
 EXTENSION_NAME = "hunyuan3d-v2-gguf"
 
-# Origen del vision safetensors pesado (~2.47 GB)
-CALCUIS_REPO_ID = "calcuis/hunyuan3d-v2-gguf"
+# Repositorio correcto de Calcuis en HF
+CALCUIS_REPO_ID = "calcuis/hy3d-gguf" 
 VISION_FILE_NAME = "hy-3d-vision.safetensors"
 TARGET_SUBFOLDER = Path("generate") / "hunyuan3d-dit-v2-0"
 
