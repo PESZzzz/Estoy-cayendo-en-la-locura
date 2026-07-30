@@ -1,3 +1,4 @@
+# Hunyuan 3D is licensed under the TENCENT HUNYUAN NON-COMMERCIAL LICENSE AGREEMENT
 import math
 import os
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ if os.environ.get('USE_SAGEATTN', '0') == '1':
         from sageattention import sageattn
         scaled_dot_product_attention = sageattn
     except ImportError:
-        pass
+        raise ImportError('Please install the package "sageattention" to use this USE_SAGEATTN.')
 
 
 def attention(q: Tensor, k: Tensor, v: Tensor, **kwargs) -> Tensor:
@@ -22,7 +23,7 @@ def attention(q: Tensor, k: Tensor, v: Tensor, **kwargs) -> Tensor:
     return x
 
 
-def timestep_embedding(t: Tensor, dim=256, max_period=10000, time_factor: float = 1000.0):
+def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
     t = time_factor * t
     half = dim // 2
     freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
@@ -48,12 +49,11 @@ class GELU(nn.Module):
 
 
 class TimeMLPEmbedder(nn.Module):
-    def __init__(self, hidden_size: int = 1024, in_dim: int = 256, time_embed_dim: int = 1024):
+    def __init__(self, hidden_size: int = 1024):
         super().__init__()
-        # in_dim DEBE ser 256 para matchear time_in.in_layer.weight -> [1024, 256] del GGUF
-        self.in_layer = nn.Linear(in_dim, time_embed_dim, bias=True)
+        self.in_layer = nn.Linear(144, 1024, bias=True)
         self.silu = nn.SiLU()
-        self.out_layer = nn.Linear(time_embed_dim, hidden_size, bias=True)
+        self.out_layer = nn.Linear(1024, hidden_size, bias=True)
 
     def forward(self, x: Tensor) -> Tensor:
         h = self.silu(self.in_layer(x))
@@ -90,18 +90,17 @@ class SelfAttention(nn.Module):
         dim: int = 1024,
         out_dim: int = 1024,
         num_heads: int = 16,
-        qkv_bias: bool = True,
-        in_dim: Optional[int] = None,
+        qkv_bias: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
+        head_dim = dim // num_heads  # 1024 // 16 = 64
 
-        self.qkv = nn.Linear(in_dim or dim, 3 * dim, bias=qkv_bias)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
         self.norm = QKNorm(head_dim)
         self.proj = nn.Linear(dim, out_dim)
 
-    def forward(self, x: Tensor, pe: Tensor = None) -> Tensor:
+    def forward(self, x: Tensor, pe: Tensor) -> Tensor:
         qkv = self.qkv(x)
         q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
@@ -118,12 +117,11 @@ class ModulationOut:
 
 
 class Modulation(nn.Module):
-    def __init__(self, dim: int = 1024, double: bool = True, vec_dim: Optional[int] = None):
+    def __init__(self, dim: int, double: bool):
         super().__init__()
         self.is_double = double
         self.multiplier = 6 if double else 3
-        actual_vec_dim = vec_dim if vec_dim is not None else dim
-        self.lin = nn.Linear(actual_vec_dim, self.multiplier * dim, bias=True)
+        self.lin = nn.Linear(dim, self.multiplier * dim, bias=True)
 
     def forward(self, vec: Tensor) -> Tuple[ModulationOut, Optional[ModulationOut]]:
         out = self.lin(nn.functional.silu(vec))[:, None, :]
@@ -141,17 +139,14 @@ class DoubleStreamBlock(nn.Module):
         hidden_size: int = 1024,
         num_heads: int = 16,
         mlp_ratio: float = 4.0,
-        qkv_bias: bool = True,
-        vec_dim: Optional[int] = None,
+        qkv_bias: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_size = hidden_size
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        actual_vec_dim = vec_dim if vec_dim is not None else hidden_size
+        mlp_hidden_dim = int(hidden_size * mlp_ratio) # 4096
         
-        # Stream de Imagen: [6144, 1024]
-        self.img_mod = Modulation(hidden_size, double=True, vec_dim=actual_vec_dim)
+        self.img_mod = Modulation(hidden_size, double=True)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.img_attn = SelfAttention(dim=hidden_size, out_dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
         self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -161,8 +156,7 @@ class DoubleStreamBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
 
-        # Stream de Texto / Condición: [6144, 1024]
-        self.txt_mod = Modulation(hidden_size, double=True, vec_dim=actual_vec_dim)
+        self.txt_mod = Modulation(hidden_size, double=True)
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_attn = SelfAttention(dim=hidden_size, out_dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -172,7 +166,7 @@ class DoubleStreamBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
 
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor = None) -> Tuple[Tensor, Tensor]:
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor) -> Tuple[Tensor, Tensor]:
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
 
@@ -196,11 +190,13 @@ class DoubleStreamBlock(nn.Module):
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
         img = img + img_mod1.gate * self.img_attn.proj(img_attn)
+        
         img_mlp_in = self.img_norm2(img)
         img_mlp_in = (1 + img_mod2.scale) * img_mlp_in + img_mod2.shift
         img = img + img_mod2.gate * self.img_mlp(img_mlp_in)
 
         txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
+        
         txt_mlp_in = self.txt_norm2(txt)
         txt_mlp_in = (1 + txt_mod2.scale) * txt_mlp_in + txt_mod2.shift
         txt = txt + txt_mod2.gate * self.txt_mlp(txt_mlp_in)
@@ -214,25 +210,25 @@ class SingleStreamBlock(nn.Module):
         hidden_size: int = 1024,
         num_heads: int = 16,
         mlp_ratio: float = 4.0,
-        vec_dim: Optional[int] = None,
+        qk_scale: Optional[float] = None,
     ):
         super().__init__()
+
         self.hidden_dim = hidden_size
         self.num_heads = num_heads
         head_dim = hidden_size // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
 
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        actual_vec_dim = vec_dim if vec_dim is not None else hidden_size
-
         self.linear1 = nn.Linear(hidden_size, 3 * hidden_size + mlp_hidden_dim)
         self.linear2 = nn.Linear(hidden_size + mlp_hidden_dim, hidden_size)
 
         self.norm = QKNorm(head_dim)
         self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp_act = GELU(approximate="tanh")
-        self.modulation = Modulation(hidden_size, double=False, vec_dim=actual_vec_dim)
+        self.modulation = Modulation(hidden_size, double=False)
 
-    def forward(self, x: Tensor, vec: Tensor, pe: Tensor = None) -> Tensor:
+    def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
         mod, _ = self.modulation(vec)
 
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
@@ -253,11 +249,8 @@ class LastLayer(nn.Module):
     def __init__(self, hidden_size: int = 1024, patch_size: int = 1, out_channels: int = 64):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, out_channels, bias=True) # [64, 1024]
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
+        self.linear = nn.Linear(hidden_size, out_channels, bias=True)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
 
     def forward(self, x: Tensor, vec: Tensor) -> Tensor:
         shift, scale = self.adaLN_modulation(vec).chunk(2, dim=1)
@@ -270,46 +263,51 @@ class Hunyuan3DDiT(nn.Module):
     def __init__(
         self,
         in_channels: int = 64,
-        context_in_dim: int = 1536,   # EXACTO AL GGUF [1024, 1536]
-        hidden_size: int = 1024,      # EXACTO AL GGUF 1024
+        context_in_dim: int = 1536,
+        hidden_size: int = 1024,
         mlp_ratio: float = 4.0,
         num_heads: int = 16,
         depth: int = 16,
         depth_single_blocks: int = 32,
+        axes_dim: List[int] = [36],
+        theta: int = 10_000,
+        qkv_bias: bool = True,
         time_factor: float = 1000,
         guidance_embed: bool = False,
-        vec_dim: Optional[int] = None,
+        ckpt_path: Optional[str] = None,
         **kwargs,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.context_in_dim = context_in_dim
         self.hidden_size = hidden_size
+        self.mlp_ratio = mlp_ratio
         self.num_heads = num_heads
+        self.depth = depth
+        self.depth_single_blocks = depth_single_blocks
+        self.axes_dim = axes_dim
+        self.theta = theta
+        self.qkv_bias = qkv_bias
         self.time_factor = time_factor
         self.out_channels = 64
         self.guidance_embed = guidance_embed
 
-        actual_vec_dim = vec_dim if vec_dim is not None else hidden_size
+        print(f"[MODLY-LOG] Initializing Hunyuan3DDiT con hidden_size={hidden_size}, num_heads={num_heads}")
 
-        # Capas de Entrada
-        self.latent_in = nn.Linear(self.in_channels, self.hidden_size, bias=True) # [1024, 64]
-        self.time_in = TimeMLPEmbedder(hidden_size=self.hidden_size, in_dim=256, time_embed_dim=1024) # in: [1024, 256], out: [1024, 1024]
-        self.cond_in = nn.Linear(self.context_in_dim, self.hidden_size, bias=True) # [1024, 1536]
-        
+        self.latent_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
+        self.time_in = TimeMLPEmbedder(hidden_size=self.hidden_size)
+        self.cond_in = nn.Linear(context_in_dim, self.hidden_size)
         self.guidance_in = (
-            TimeMLPEmbedder(hidden_size=self.hidden_size, in_dim=256, time_embed_dim=1024)
-            if guidance_embed else nn.Identity()
+            TimeMLPEmbedder(hidden_size=self.hidden_size) if guidance_embed else nn.Identity()
         )
 
-        # Bloques de Atencion
         self.double_blocks = nn.ModuleList(
             [
                 DoubleStreamBlock(
                     hidden_size=self.hidden_size,
                     num_heads=self.num_heads,
                     mlp_ratio=mlp_ratio,
-                    vec_dim=actual_vec_dim,
+                    qkv_bias=qkv_bias,
                 )
                 for _ in range(depth)
             ]
@@ -321,29 +319,53 @@ class Hunyuan3DDiT(nn.Module):
                     hidden_size=self.hidden_size,
                     num_heads=self.num_heads,
                     mlp_ratio=mlp_ratio,
-                    vec_dim=actual_vec_dim,
                 )
                 for _ in range(depth_single_blocks)
             ]
         )
 
-        self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels) # [64, 1024]
+        self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
+
+        if ckpt_path is not None:
+            print('[MODLY-LOG] Cargando checkpoint desde:', ckpt_path)
+
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            if 'state_dict' not in ckpt:
+                state_dict = {}
+                for k in ckpt.keys():
+                    new_k = k.replace('_forward_module.', '')
+                    state_dict[new_k] = ckpt[k]
+            else:
+                state_dict = ckpt["state_dict"]
+
+            final_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('model.'):
+                    final_state_dict[k.replace('model.', '')] = v
+                else:
+                    final_state_dict[k] = v
+            
+            missing, unexpected = self.load_state_dict(final_state_dict, strict=False)
+            print('[MODLY-LOG] Unexpected keys count:', len(unexpected))
+            print('[MODLY-LOG] Missing keys count:', len(missing))
 
     def forward(
         self,
-        x: Tensor,
-        t: Tensor,
-        contexts: dict,
-        guidance: Optional[Tensor] = None,
+        x,
+        t,
+        contexts,
         **kwargs,
     ) -> Tensor:
-        cond = contexts['main'] if isinstance(contexts, dict) and 'main' in contexts else contexts
+        cond = contexts['main']
 
         latent = self.latent_in(x)
-        vec = self.time_in(timestep_embedding(t, dim=256, time_factor=self.time_factor).to(dtype=latent.dtype))
+        vec = self.time_in(timestep_embedding(t, 144, self.time_factor).to(dtype=latent.dtype))
 
-        if self.guidance_embed and guidance is not None:
-            vec = vec + self.guidance_in(timestep_embedding(guidance, dim=256, time_factor=self.time_factor).to(dtype=latent.dtype))
+        if self.guidance_embed:
+            guidance = kwargs.get('guidance', None)
+            if guidance is None:
+                raise ValueError("Didn't get guidance strength for guidance distilled model.")
+            vec = vec + self.guidance_in(timestep_embedding(guidance, 144, self.time_factor))
 
         cond = self.cond_in(cond)
         pe = None

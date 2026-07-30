@@ -1,15 +1,14 @@
 model:
   target: hy3dgen.shapegen.models.Hunyuan3DDiT
   params:
-    in_channels: 64         # Cambiar de 44 a 64
-    out_channels: 64        # Asegurar 64
+    in_channels: 64
+    context_in_dim: 1536
     hidden_size: 1024
+    mlp_ratio: 4.0
     num_heads: 16
     depth: 16
     depth_single_blocks: 32
-    time_dim: 256
-    context_in_dim: 1536
-    axes_dim: [36]
+    axes_dim: [ 36 ]
     theta: 10000
     qkv_bias: true
 
