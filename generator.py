@@ -37,9 +37,11 @@ class Hunyuan3DGGUFGenerator(BaseGenerator):
         if not model_dir.exists():
             return False
         
-        # Verificar que exista al menos un archivo GGUF en el directorio
-        has_gguf = any(f.name.endswith('.gguf') for f in model_dir.iterdir())
-        return has_gguf
+        # Verificar que exista el archivo GGUF específico o al menos uno
+        gguf_path = model_dir / _GGUF_FILE_NAME
+        if gguf_path.exists():
+            return True
+        return any(f.name.endswith('.gguf') for f in model_dir.iterdir())
 
     def load(self) -> None:
         """Carga el pipeline a memoria usando el motor hy3dgen parcheado."""
@@ -94,13 +96,17 @@ class Hunyuan3DGGUFGenerator(BaseGenerator):
 
         target_dir = self.model_dir / _DIT_SUBFOLDER if (self.model_dir / _DIT_SUBFOLDER).exists() else self.model_dir
         config_path = target_dir / "config.yaml"
+        gguf_path = target_dir / _GGUF_FILE_NAME
 
-        print(f"[Hunyuan3DGGUFGenerator] Cargando pipeline modular GGUF desde {target_dir}...")
+        # Si el archivo exacto existe, apuntamos directamente a él
+        ckpt_target = str(gguf_path) if gguf_path.exists() else str(target_dir)
+
+        print(f"[Hunyuan3DGGUFGenerator] Cargando pipeline modular GGUF desde {ckpt_target}...")
         
-        # 3. Carga directa adaptada a la arquitectura modular (GGUF + Safetensors)
+        # 3. Carga directa adaptada a la arquitectura modular (GGUF)
         try:
             pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
-                ckpt_path=str(target_dir),
+                ckpt_path=ckpt_target,
                 config_path=str(config_path),
                 device=device,
                 dtype=dtype,
