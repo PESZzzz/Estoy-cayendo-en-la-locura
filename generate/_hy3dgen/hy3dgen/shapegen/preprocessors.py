@@ -136,17 +136,11 @@ class MVImageProcessorV2(ImageProcessorV2):
         if self.border_ratio is not None:
             border_ratio = self.border_ratio
 
-        # PARCHE MODLY: Si nos entra una imagen suelta/ruta en vez de un dict, la empaquetamos como 'front'
-        if not isinstance(image_dict, dict):
-            image_dict = {'front': image_dict}
-
         images = []
         masks = []
         view_idxs = []
         for idx, (view_tag, image) in enumerate(image_dict.items()):
-            # Si viene una vista desconocida, caemos a 'front' para no romper
-            tag = view_tag if view_tag in self.view2idx else 'front'
-            view_idxs.append(self.view2idx[tag])
+            view_idxs.append(self.view2idx[view_tag])
             image, mask = self.load_image(image, border_ratio=border_ratio, to_tensor=to_tensor)
             images.append(image)
             masks.append(mask)
