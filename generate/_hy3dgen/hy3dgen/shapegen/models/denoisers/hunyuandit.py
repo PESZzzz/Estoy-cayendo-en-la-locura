@@ -1,19 +1,6 @@
 # Hunyuan 3D is licensed under the TENCENT HUNYUAN NON-COMMERCIAL LICENSE AGREEMENT
-# except for the third-party components listed below.
-# Hunyuan 3D does not impose any additional limitations beyond what is outlined
-# in the repsective licenses of these third-party components.
-# Users must comply with all terms and conditions of original licenses of these third-party
-# components and must ensure that the usage of the third party components adheres to
-# all relevant laws and regulations.
-
-# For avoidance of doubts, Hunyuan 3D means the large language models and
-# their software and algorithms, including trained model weights, parameters (including
-# optimizer states), machine-learning model code, inference-enabling code, training-enabling code,
-# fine-tuning enabling code and other elements of the foregoing made publicly available
-# by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 import math
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -85,23 +72,21 @@ class TimestepEmbedder(nn.Module):
         super().__init__()
         if out_size is None:
             out_size = hidden_size
+
+        self.time_embed = Timesteps(frequency_embedding_size)
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, frequency_embedding_size, bias=True),
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.GELU(),
-            nn.Linear(frequency_embedding_size, out_size, bias=True),
+            nn.Linear(hidden_size, out_size, bias=True),
         )
         self.frequency_embedding_size = frequency_embedding_size
 
         if cond_proj_dim is not None:
             self.cond_proj = nn.Linear(cond_proj_dim, frequency_embedding_size, bias=False)
 
-        self.time_embed = Timesteps(hidden_size)
-
-    def forward(self, t, condition):
-
+    def forward(self, t, condition=None):
         t_freq = self.time_embed(t).type(self.mlp[0].weight.dtype)
 
-        # t_freq = timestep_embedding(t, self.frequency_embedding_size).type(self.mlp[0].weight.dtype)
         if condition is not None:
             t_freq = t_freq + self.cond_proj(condition)
 
@@ -142,14 +127,12 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         assert self.qdim % num_heads == 0, "self.qdim must be divisible by num_heads"
         self.head_dim = self.qdim // num_heads
-        assert self.head_dim % 8 == 0 and self.head_dim <= 128, "Only support head_dim <= 128 and divisible by 8"
         self.scale = self.head_dim ** -0.5
 
         self.to_q = nn.Linear(qdim, qdim, bias=qkv_bias)
         self.to_k = nn.Linear(kdim, qdim, bias=qkv_bias)
         self.to_v = nn.Linear(kdim, qdim, bias=qkv_bias)
 
-        # TODO: eps should be 1 / 65530 if using fp16
         self.q_norm = norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6) if qk_norm else nn.Identity()
         self.out_proj = nn.Linear(qdim, qdim, bias=True)
@@ -162,76 +145,38 @@ class CrossAttention(nn.Module):
             self.dca_weight = decoupled_ca_weight
 
     def forward(self, x, y):
-        """
-        Parameters
-        ----------
-        x: torch.Tensor
-            (batch, seqlen1, hidden_dim) (where hidden_dim = num heads * head dim)
-        y: torch.Tensor
-            (batch, seqlen2, hidden_dim2)
-        freqs_cis_img: torch.Tensor
-            (batch, hidden_dim // 2), RoPE for image
-        """
-        b, s1, c = x.shape  # [b, s1, D]
+        b, s1, _ = x.shape
 
         if self.with_dca:
             token_len = y.shape[1]
             context_dca = y[:, -self.dca_dim:, :]
             kv_dca = self.kv_proj_dca(context_dca).view(b, self.dca_dim, 2, self.num_heads, self.head_dim)
-            k_dca, v_dca = kv_dca.unbind(dim=2)  # [b, s, h, d]
+            k_dca, v_dca = kv_dca.unbind(dim=2)
             k_dca = self.k_norm_dca(k_dca)
             y = y[:, :(token_len - self.dca_dim), :]
 
-        _, s2, c = y.shape  # [b, s2, 1024]
-        q = self.to_q(x)
-        k = self.to_k(y)
-        v = self.to_v(y)
+        b, s2, _ = y.shape
+        q = self.to_q(x).view(b, s1, self.num_heads, self.head_dim)
+        k = self.to_k(y).view(b, s2, self.num_heads, self.head_dim)
+        v = self.to_v(y).view(b, s2, self.num_heads, self.head_dim)
 
-        kv = torch.cat((k, v), dim=-1)
-        split_size = kv.shape[-1] // self.num_heads // 2
-        kv = kv.view(1, -1, self.num_heads, split_size * 2)
-        k, v = torch.split(kv, split_size, dim=-1)
+        q = self.q_norm(q).transpose(1, 2)  # [b, h, s1, d]
+        k = self.k_norm(k).transpose(1, 2)  # [b, h, s2, d]
+        v = v.transpose(1, 2)               # [b, h, s2, d]
 
-        q = q.view(b, s1, self.num_heads, self.head_dim)  # [b, s1, h, d]
-        k = k.view(b, s2, self.num_heads, self.head_dim)  # [b, s2, h, d]
-        v = v.view(b, s2, self.num_heads, self.head_dim)  # [b, s2, h, d]
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=True,
-            enable_math=False,
-            enable_mem_efficient=True
-        ):
-            q, k, v = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads), (q, k, v))
-            context = F.scaled_dot_product_attention(
-                q, k, v
-            ).transpose(1, 2).reshape(b, s1, -1)
+        context = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, s1, -1)
 
         if self.with_dca:
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=True,
-                enable_math=False,
-                enable_mem_efficient=True
-            ):
-                k_dca, v_dca = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads),
-                                   (k_dca, v_dca))
-                context_dca = F.scaled_dot_product_attention(
-                    q, k_dca, v_dca).transpose(1, 2).reshape(b, s1, -1)
-
+            k_dca = k_dca.transpose(1, 2)
+            v_dca = v_dca.transpose(1, 2)
+            context_dca = F.scaled_dot_product_attention(q, k_dca, v_dca).transpose(1, 2).reshape(b, s1, -1)
             context = context + self.dca_weight * context_dca
 
-        out = self.out_proj(context)  # context.reshape - B, L1, -1
-
+        out = self.out_proj(context)
         return out
 
 
 class Attention(nn.Module):
-    """
-    We rename some layer names to align with flash attention
-    """
-
     def __init__(
         self,
         dim,
@@ -245,14 +190,11 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         assert self.dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.head_dim = self.dim // num_heads
-        # This assertion is aligned with flash attention
-        assert self.head_dim % 8 == 0 and self.head_dim <= 128, "Only support head_dim <= 128 and divisible by 8"
         self.scale = self.head_dim ** -0.5
 
         self.to_q = nn.Linear(dim, dim, bias=qkv_bias)
         self.to_k = nn.Linear(dim, dim, bias=qkv_bias)
         self.to_v = nn.Linear(dim, dim, bias=qkv_bias)
-        # TODO: eps should be 1 / 65530 if using fp16
         self.q_norm = norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6) if qk_norm else nn.Identity()
         self.out_proj = nn.Linear(dim, dim)
@@ -260,29 +202,15 @@ class Attention(nn.Module):
     def forward(self, x):
         B, N, C = x.shape
 
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
+        q = self.to_q(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.to_k(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.to_v(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-        qkv = torch.cat((q, k, v), dim=-1)
-        split_size = qkv.shape[-1] // self.num_heads // 3
-        qkv = qkv.view(1, -1, self.num_heads, split_size * 3)
-        q, k, v = torch.split(qkv, split_size, dim=-1)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
-        q = q.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [b, h, s, d]
-        k = k.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [b, h, s, d]
-        v = v.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-
-        q = self.q_norm(q)  # [b, h, s, d]
-        k = self.k_norm(k)  # [b, h, s, d]
-
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=True,
-            enable_math=False,
-            enable_mem_efficient=True
-        ):
-            x = F.scaled_dot_product_attention(q, k, v)
-            x = x.transpose(1, 2).reshape(B, N, -1)
+        x = F.scaled_dot_product_attention(q, k, v)
+        x = x.transpose(1, 2).reshape(B, N, C)
 
         x = self.out_proj(x)
         return x
@@ -294,7 +222,7 @@ class HunYuanDiTBlock(nn.Module):
         hidden_size,
         c_emb_size,
         num_heads,
-        text_states_dim=1024,
+        text_states_dim=1536,
         use_flash_attn=False,
         qk_norm=False,
         norm_layer=nn.LayerNorm,
@@ -315,16 +243,12 @@ class HunYuanDiTBlock(nn.Module):
         self.use_flash_attn = use_flash_attn
         use_ele_affine = True
 
-        # ========================= Self-Attention =========================
         self.norm1 = norm_layer(hidden_size, elementwise_affine=use_ele_affine, eps=1e-6)
         self.attn1 = Attention(hidden_size, num_heads=num_heads, qkv_bias=qkv_bias, qk_norm=qk_norm,
                                norm_layer=qk_norm_layer)
 
-        # ========================= FFN =========================
         self.norm2 = norm_layer(hidden_size, elementwise_affine=use_ele_affine, eps=1e-6)
 
-        # ========================= Add =========================
-        # Simply use add like SDXL.
         self.timested_modulate = timested_modulate
         if self.timested_modulate:
             self.default_modulation = nn.Sequential(
@@ -332,7 +256,6 @@ class HunYuanDiTBlock(nn.Module):
                 nn.Linear(c_emb_size, hidden_size, bias=True)
             )
 
-        # ========================= Cross-Attention =========================
         self.attn2 = CrossAttention(hidden_size, text_states_dim, num_heads=num_heads, qkv_bias=qkv_bias,
                                     qk_norm=qk_norm, norm_layer=qk_norm_layer,
                                     with_decoupled_ca=with_decoupled_ca, decoupled_ca_dim=decoupled_ca_dim,
@@ -348,7 +271,6 @@ class HunYuanDiTBlock(nn.Module):
 
         self.use_moe = use_moe
         if self.use_moe:
-            print("using moe")
             self.moe = MoEBlock(
                 hidden_size,
                 num_experts=num_experts,
@@ -363,25 +285,20 @@ class HunYuanDiTBlock(nn.Module):
             self.mlp = MLP(width=hidden_size)
 
     def forward(self, x, c=None, text_states=None, skip_value=None):
-
         if self.skip_linear is not None:
             cat = torch.cat([skip_value, x], dim=-1)
             x = self.skip_linear(cat)
             x = self.skip_norm(x)
 
-        # Self-Attention
         if self.timested_modulate:
             shift_msa = self.default_modulation(c).unsqueeze(dim=1)
             x = x + shift_msa
 
         attn_out = self.attn1(self.norm1(x))
-
         x = x + attn_out
 
-        # Cross-Attention
         x = x + self.attn2(self.norm2(x), text_states)
 
-        # FFN Layer
         mlp_inputs = self.norm3(x)
 
         if self.use_moe:
@@ -408,10 +325,10 @@ class AttentionPool(nn.Module):
             attention_mask = attention_mask.unsqueeze(-1).permute(1, 0, 2)
             global_emb = (x * attention_mask).sum(dim=0) / attention_mask.sum(dim=0)
             x = torch.cat([global_emb[None,], x], dim=0)
-
         else:
-            x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (L+1)NC
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (L+1)NC
+            x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)
+
+        x = x + self.positional_embedding[:, None, :].to(x.dtype)
         x, _ = F.multi_head_attention_forward(
             query=x[:1], key=x, value=x,
             embed_dim_to_check=x.shape[-1],
@@ -435,10 +352,6 @@ class AttentionPool(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    """
-    The final layer of HunYuanDiT.
-    """
-
     def __init__(self, final_hidden_size, out_channels):
         super().__init__()
         self.final_hidden_size = final_hidden_size
@@ -453,13 +366,12 @@ class FinalLayer(nn.Module):
 
 
 class HunYuanDiTPlain(nn.Module):
-
     def __init__(
         self,
         input_size=1024,
-        in_channels=4,
+        in_channels=64,
         hidden_size=1024,
-        context_dim=1024,
+        context_dim=1536,
         depth=24,
         num_heads=16,
         mlp_ratio=4.0,
@@ -501,16 +413,14 @@ class HunYuanDiTPlain(nn.Module):
         self.text_len = text_len
 
         self.x_embedder = nn.Linear(in_channels, hidden_size, bias=True)
-        self.t_embedder = TimestepEmbedder(hidden_size, hidden_size * 4, cond_proj_dim=guidance_cond_proj_dim)
+        self.t_embedder = TimestepEmbedder(hidden_size, frequency_embedding_size=256, cond_proj_dim=guidance_cond_proj_dim)
 
-        # Will use fixed sin-cos embedding:
         if self.use_pos_emb:
             self.register_buffer("pos_embed", torch.zeros(1, input_size, hidden_size))
             pos = np.arange(self.input_size, dtype=np.float32)
             pos_embed = get_1d_sincos_pos_embed_from_grid(self.pos_embed.shape[-1], pos)
             self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        self.use_attention_pooling = use_attention_pooling
         if use_attention_pooling:
             self.pooler = AttentionPool(self.text_len, context_dim, num_heads=8, output_dim=1024)
             self.extra_embedder = nn.Sequential(
@@ -527,7 +437,6 @@ class HunYuanDiTPlain(nn.Module):
                 nn.Linear(hidden_size * 4, 1024, bias=True),
             )
 
-        # HUnYuanDiT Blocks
         self.blocks = nn.ModuleList([
             HunYuanDiTBlock(hidden_size=hidden_size,
                             c_emb_size=hidden_size,
@@ -548,7 +457,6 @@ class HunYuanDiTPlain(nn.Module):
                             )
             for layer in range(depth)
         ])
-        self.depth = depth
 
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
 
@@ -564,7 +472,7 @@ class HunYuanDiTPlain(nn.Module):
 
         if self.use_attention_pooling:
             extra_vec = self.pooler(cond, None)
-            c = t + self.extra_embedder(extra_vec)  # [B, D]
+            c = t + self.extra_embedder(extra_vec)
         else:
             c = t
 

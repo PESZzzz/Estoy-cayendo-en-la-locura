@@ -49,11 +49,11 @@ class GELU(nn.Module):
 
 
 class TimeMLPEmbedder(nn.Module):
-    def __init__(self, hidden_size: int = 1024):
+    def __init__(self, in_dim: int = 256, hidden_size: int = 1024):
         super().__init__()
-        self.in_layer = nn.Linear(144, 1024, bias=True)
+        self.in_layer = nn.Linear(in_dim, hidden_size, bias=True)
         self.silu = nn.SiLU()
-        self.out_layer = nn.Linear(1024, hidden_size, bias=True)
+        self.out_layer = nn.Linear(hidden_size, hidden_size, bias=True)
 
     def forward(self, x: Tensor) -> Tensor:
         h = self.silu(self.in_layer(x))
@@ -94,7 +94,7 @@ class SelfAttention(nn.Module):
     ):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads  # 1024 // 16 = 64
+        head_dim = dim // num_heads
 
         self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
         self.norm = QKNorm(head_dim)
@@ -144,7 +144,7 @@ class DoubleStreamBlock(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_size = hidden_size
-        mlp_hidden_dim = int(hidden_size * mlp_ratio) # 4096
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
         
         self.img_mod = Modulation(hidden_size, double=True)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -265,6 +265,7 @@ class Hunyuan3DDiT(nn.Module):
         in_channels: int = 64,
         context_in_dim: int = 1536,
         hidden_size: int = 1024,
+        time_dim: int = 256,
         mlp_ratio: float = 4.0,
         num_heads: int = 16,
         depth: int = 16,
@@ -281,6 +282,7 @@ class Hunyuan3DDiT(nn.Module):
         self.in_channels = in_channels
         self.context_in_dim = context_in_dim
         self.hidden_size = hidden_size
+        self.time_dim = time_dim
         self.mlp_ratio = mlp_ratio
         self.num_heads = num_heads
         self.depth = depth
@@ -292,13 +294,13 @@ class Hunyuan3DDiT(nn.Module):
         self.out_channels = 64
         self.guidance_embed = guidance_embed
 
-        print(f"[MODLY-LOG] Initializing Hunyuan3DDiT con hidden_size={hidden_size}, num_heads={num_heads}")
+        print(f"[MODLY-LOG] Initializing Hunyuan3DDiT con hidden_size={hidden_size}, num_heads={num_heads}, time_dim={time_dim}")
 
         self.latent_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
-        self.time_in = TimeMLPEmbedder(hidden_size=self.hidden_size)
+        self.time_in = TimeMLPEmbedder(in_dim=self.time_dim, hidden_size=self.hidden_size)
         self.cond_in = nn.Linear(context_in_dim, self.hidden_size)
         self.guidance_in = (
-            TimeMLPEmbedder(hidden_size=self.hidden_size) if guidance_embed else nn.Identity()
+            TimeMLPEmbedder(in_dim=self.time_dim, hidden_size=self.hidden_size) if guidance_embed else nn.Identity()
         )
 
         self.double_blocks = nn.ModuleList(
@@ -359,13 +361,13 @@ class Hunyuan3DDiT(nn.Module):
         cond = contexts['main']
 
         latent = self.latent_in(x)
-        vec = self.time_in(timestep_embedding(t, 144, self.time_factor).to(dtype=latent.dtype))
+        vec = self.time_in(timestep_embedding(t, self.time_dim, self.time_factor).to(dtype=latent.dtype))
 
         if self.guidance_embed:
             guidance = kwargs.get('guidance', None)
             if guidance is None:
                 raise ValueError("Didn't get guidance strength for guidance distilled model.")
-            vec = vec + self.guidance_in(timestep_embedding(guidance, 144, self.time_factor))
+            vec = vec + self.guidance_in(timestep_embedding(guidance, self.time_dim, self.time_factor))
 
         cond = self.cond_in(cond)
         pe = None
