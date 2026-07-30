@@ -1,6 +1,6 @@
 """
 Hunyuan3D 2 Mini (GGUF) — Extension setup script for Modly.
-Streamlined build: Uses custom GitHub patched code + Direct HF vision downloader
+Streamlined build: Uses custom GitHub patched code + Direct HF downloader (Vision + GGUF + Pig VAE)
 + Auto-organizes models in Documents/Modly/models/hunyuan3d-v2-gguf.
 """
 
@@ -17,10 +17,16 @@ from pathlib import Path
 # ------------------------------------------------------------------ #
 EXTENSION_NAME = "hunyuan3d-v2-gguf"
 
-# Origen del vision safetensors pesado (~2.47 GB)
-CALCUIS_REPO_ID = "calcuis/hunyuan3d-v2-gguf"
-VISION_FILE_NAME = "hy-3d-vision.safetensors"
+# Repositorio correcto de Calcuis en HF
+CALCUIS_REPO_ID = "calcuis/hy3d-gguf" 
 TARGET_SUBFOLDER = Path("generate") / "hunyuan3d-dit-v2-0"
+
+# Archivos indispensables de la trinidad
+MODEL_FILES = [
+    "hy-3d-vision.safetensors",
+    "hy-3d_fp32-q4_k_m.gguf",
+    "pig_3d_vae_fp32-f16.gguf"
+]
 
 PACKAGES = [
     "torch",
@@ -59,30 +65,37 @@ def pip(venv: Path, *args: str) -> None:
     subprocess.run([str(python_exe), "-m", "pip", *args], check=True)
 
 
-def download_vision_model(ext_dir: Path, venv: Path) -> None:
-    """Descarga el hy-3d-vision.safetensors dentro de generate/hunyuan3d-dit-v2-0."""
+def download_models(ext_dir: Path, venv: Path) -> None:
+    """Descarga los modelos reales (Vision, GGUF y Pig VAE) desde HF si no existen o si son punteros corruptos/LFS de 1KB."""
     target_dir = ext_dir / TARGET_SUBFOLDER
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_file = target_dir / VISION_FILE_NAME
-
-    if target_file.exists():
-        log(f"El archivo vision safetensors ya está presente en: {target_file}")
-        return
-
-    log(f"Descargando {VISION_FILE_NAME} desde Hugging Face ({CALCUIS_REPO_ID})...")
     python_venv = get_python(venv)
 
-    download_script = (
-        f"from huggingface_hub import hf_hub_download\n"
-        f"hf_hub_download("
-        f"repo_id='{CALCUIS_REPO_ID}', "
-        f"filename='{VISION_FILE_NAME}', "
-        f"local_dir=r'{target_dir}', "
-        f"local_dir_use_symlinks=False)\n"
-    )
+    for file_name in MODEL_FILES:
+        target_file = target_dir / file_name
 
-    subprocess.run([str(python_venv), "-c", download_script], check=True)
-    log(f"Descarga de {VISION_FILE_NAME} completada exitosamente en {target_dir}.")
+        # Si el archivo existe pero pesa menos de 1 MB, asumimos que es un puntero LFS corrupto y lo borramos
+        if target_file.exists():
+            if target_file.stat().st_size < 1024 * 1024:
+                log(f"El archivo {file_name} parece ser un puntero Git LFS de pocos KB. Eliminando para redescargar...")
+                target_file.unlink()
+            else:
+                log(f"El archivo {file_name} ya está presente y válido en: {target_file}")
+                continue
+
+        log(f"Descargando {file_name} desde Hugging Face ({CALCUIS_REPO_ID})...")
+
+        download_script = (
+            f"from huggingface_hub import hf_hub_download\n"
+            f"hf_hub_download("
+            f"repo_id='{CALCUIS_REPO_ID}', "
+            f"filename='{file_name}', "
+            f"local_dir=r'{target_dir}', "
+            f"local_dir_use_symlinks=False)\n"
+        )
+
+        subprocess.run([str(python_venv), "-c", download_script], check=True)
+        log(f"Descarga de {file_name} completada exitosamente.")
 
 
 def sync_to_modly_models(ext_dir: Path) -> None:
@@ -147,8 +160,8 @@ def setup(
     except Exception as e:
         log(f"Aviso al crear el enlace .pth: {e}")
 
-    # 3. Descargar el vision safetensors a generate/
-    download_vision_model(ext_dir, venv)
+    # 3. Descargar la trinidad completa de modelos directamente vía HF Hub
+    download_models(ext_dir, venv)
 
     # 4. Mover/Sincronizar 'generate' a Documents/Modly/models/hunyuan3d-v2-gguf
     sync_to_modly_models(ext_dir)
