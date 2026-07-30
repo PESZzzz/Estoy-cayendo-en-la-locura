@@ -146,6 +146,24 @@ class Hunyuan3DDiTPipeline:
 
         # 1. Instanciación e Inyección del DiT (GGUF)
         model = instantiate_from_config(config['model'])
+
+        # ==================== 🧪 DIAGNÓSTICO MAMI TETO ====================
+        logger.info("\n" + "="*60)
+        logger.info(f"[INFORME TETO] 🏗️ Clase del modelo instanciado: {type(model).__name__}")
+        
+        for attr in ['hidden_size', 'context_in_dim', 'time_dim']:
+            val = getattr(model, attr, "NO EXISTE")
+            logger.info(f"[INFORME TETO] Atributo model.{attr} = {val}")
+
+        if hasattr(model, 'time_in') and hasattr(model.time_in, 'in_layer'):
+            logger.info(f"[INFORME TETO] model.time_in.in_layer.weight shape: {model.time_in.in_layer.weight.shape}")
+        if hasattr(model, 'cond_in'):
+            logger.info(f"[INFORME TETO] model.cond_in.weight shape:          {model.cond_in.weight.shape}")
+        if hasattr(model, 'double_blocks') and len(model.double_blocks) > 0 and hasattr(model.double_blocks[0], 'img_mod'):
+            logger.info(f"[INFORME TETO] model.double_blocks[0].img_mod shape: {model.double_blocks[0].img_mod.lin.weight.shape}")
+        logger.info("="*60 + "\n")
+        # =================================================================
+
         dit_gguf_path = None
         
         if os.path.isdir(model_dir):
@@ -155,7 +173,7 @@ class Hunyuan3DDiTPipeline:
                     break
 
         if dit_gguf_path and os.path.exists(dit_gguf_path):
-            logger.info(f"\n{'='*60}\n[MODLY-GGUF] 🚀 Cargando DiT desde: {dit_gguf_path}")
+            logger.info(f"[MODLY-GGUF] 🚀 Cargando DiT desde: {dit_gguf_path}")
             try:
                 import gguf
                 reader = gguf.GGUFReader(dit_gguf_path)
@@ -274,36 +292,22 @@ class Hunyuan3DDiTPipeline:
         # 2. Configuración
         config_path = os.path.join(target_dir, "config.yaml") if os.path.isdir(target_dir) else target_dir
 
-        # 3. Buscar el ARCHIVO real de pesos (.safetensors / .ckpt)
+        # 3. Buscar el ARCHIVO real de pesos (.safetensors / .ckpt / .gguf)
         ext = 'safetensors' if use_safetensors else 'ckpt'
         ckpt_path = None
 
         if os.path.isdir(target_dir):
-            candidates = [
-                os.path.join(target_dir, f"model.{variant}.{ext}" if variant else f"model.{ext}"),
-                os.path.join(target_dir, f"model.{ext}"),
-            ]
-            for cand in candidates:
-                if os.path.exists(cand):
-                    ckpt_path = cand
-                    break
-
-            # 3. Buscar el ARCHIVO real de pesos (.safetensors / .ckpt / .gguf)
-        ext = 'safetensors' if use_safetensors else 'ckpt'
-        ckpt_path = None
-
-        if os.path.isdir(target_dir):
-            # Escanear la carpeta en busca de cualquier archivo que termine con la extensión requerida
             for file in os.listdir(target_dir):
-                if file.endswith(f".{ext}"):
+                if file.endswith(f".{ext}") or file.endswith(".gguf"):
                     ckpt_path = os.path.join(target_dir, file)
                     logger.info(f"[MODLY] ¡Archivo de pesos encontrado!: {ckpt_path}")
                     break
         else:
             ckpt_path = target_dir
 
-        if not ckpt_path or not os.path.isfile(ckpt_path):
-            raise FileNotFoundError(f"No se encontró un archivo de pesos válidos (.{ext}) dentro de: {target_dir}")
+        if not ckpt_path or not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"No se encontró un archivo de pesos válidos en: {target_dir}")
+
         return cls.from_single_file(
             ckpt_path,
             config_path,
@@ -592,7 +596,7 @@ class Hunyuan3DDiTPipeline:
         box_v=1.01,
         octree_resolution=384,
         mc_level=-1 / 512,
-        num_chunks=65536,  # Optimizado a batch masivo por defecto
+        num_chunks=65536,
         mc_algo=None,
         output_type: Optional[str] = "trimesh",
         enable_pbar=True,
@@ -676,7 +680,7 @@ class Hunyuan3DDiTPipeline:
         output_type='trimesh',
         box_v=1.01,
         mc_level=0.0,
-        num_chunks=65536,  # Optimizado a batch masivo por defecto
+        num_chunks=65536,
         octree_resolution=256,
         mc_algo='mc',
         enable_pbar=True
@@ -718,7 +722,7 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         octree_resolution=384,
         mc_level=0.0,
         mc_algo=None,
-        num_chunks=65536,  # Optimizado a batch masivo por defecto
+        num_chunks=65536,
         output_type: Optional[str] = "trimesh",
         enable_pbar=True,
         **kwargs,
