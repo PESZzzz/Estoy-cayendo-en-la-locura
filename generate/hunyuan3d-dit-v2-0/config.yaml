@@ -3,14 +3,14 @@ model:
   params:
     in_channels: 64
     context_in_dim: 1536
-    hidden_size: 576
+    hidden_size: 1024
     mlp_ratio: 4.0
     num_heads: 16
     depth: 16
     depth_single_blocks: 32
-    axes_dim: [ 64 ]
+    axes_dim: [ 36 ]
     theta: 10000
-    qkv_bias: True
+    qkv_bias: true
 
 vae:
   target: hy3dgen.shapegen.models.ShapeVAE
@@ -30,7 +30,7 @@ conditioner:
   target: hy3dgen.shapegen.models.SingleImageEncoder
   params:
     main_image_encoder:
-      type: DinoImageEncoder # dino giant
+      type: DinoImageEncoderMV # dino giant
       kwargs:
         config:
           attention_probs_dropout_prob: 0.0
@@ -59,7 +59,7 @@ scheduler:
     num_train_timesteps: 1000
 
 image_processor:
-  target: hy3dgen.shapegen.preprocessors.ImageProcessorV2
+  target: hy3dgen.shapegen.preprocessors.MVImageProcessorV2
   params:
     size: 512
     border_ratio: 0.15

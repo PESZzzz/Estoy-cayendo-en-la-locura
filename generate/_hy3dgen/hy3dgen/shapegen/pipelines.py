@@ -190,8 +190,10 @@ class Hunyuan3DDiTPipeline:
                 vae_state_dict = {}
                 for tensor in reader_vae.tensors:
                     t_name = tensor.name
-                    if t_name.startswith("vae."):
-                        t_name = t_name[4:]
+                    # Parche: Remueve prefijos comunes de GGUF VAEs
+                    for prefix in ["vae.", "first_stage_model.", "decoder."]:
+                        if t_name.startswith(prefix):
+                            t_name = t_name[len(prefix):]
                     t_data = torch.from_numpy(tensor.data)
                     if t_data.is_floating_point():
                         t_data = t_data.to(dtype)
@@ -207,14 +209,32 @@ class Hunyuan3DDiTPipeline:
 
         # 3. Instanciación e Inyección del Conditioner / Vision Encoder
         conditioner = instantiate_from_config(config['conditioner'])
-        vision_path = os.path.join(model_dir, "hy-3d-vision.safetensors")
         
-        if os.path.exists(vision_path):
+        # Buscar variantes de nombres para el Vision Encoder (.safetensors)
+        vision_path = None
+        if os.path.isdir(model_dir):
+            for file in os.listdir(model_dir):
+                if file.endswith('.safetensors') and ('vision' in file.lower() or 'mv' in file.lower()):
+                    vision_path = os.path.join(model_dir, file)
+                    break
+        
+        if vision_path and os.path.exists(vision_path):
             logger.info(f"[MODLY-GGUF] 👁️ Cargando Vision Encoder desde: {vision_path}")
             try:
                 import safetensors.torch
                 vision_weights = safetensors.torch.load_file(vision_path, device='cpu')
-                conditioner.load_state_dict(vision_weights, strict=False)
+                
+                # Filtrar solo claves pertenecientes al conditioner/vision si vienen de un ckpt completo
+                cond_weights = {}
+                for k, v in vision_weights.items():
+                    if k.startswith("conditioner."):
+                        cond_weights[k[12:]] = v
+                    elif k.startswith("vision_model."):
+                        cond_weights[k] = v
+                    else:
+                        cond_weights[k] = v
+                        
+                conditioner.load_state_dict(cond_weights, strict=False)
                 logger.info("[MODLY-GGUF] ✅ Vision Encoder cargado exitosamente.")
             except Exception as e:
                 logger.warning(f"[MODLY-GGUF] ⚠️ Error al leer Vision Encoder: {e}")
