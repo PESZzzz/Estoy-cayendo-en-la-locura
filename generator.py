@@ -102,7 +102,7 @@ class Hunyuan3DGGUFGenerator(BaseGenerator):
 
         ckpt_target = str(gguf_path) if gguf_path.exists() else str(target_dir)
 
-        print(f"[Hunyuan3DGGUFGenerator] 🚀 Cargando Pipeline GGUF Híbrido ({device}, {dtype}) desde: {ckpt_target}")
+        print(f"[Hunyuan3DGGUFGenerator] Cargando Pipeline GGUF Híbrido ({device}, {dtype}) desde: {ckpt_target}")
         
         # 3. Instanciación desde el pipeline refactorizado
         try:
@@ -113,11 +113,11 @@ class Hunyuan3DGGUFGenerator(BaseGenerator):
                 dtype=dtype,
             )
         except Exception as err:
-            print(f"[Hunyuan3DGGUFGenerator] ❌ ERROR CRÍTICO al inicializar pipeline: {err}")
+            print(f"[Hunyuan3DGGUFGenerator] ERROR CRÍTICO al inicializar pipeline: {err}")
             raise RuntimeError(f"Fallo al instanciar el modelo GGUF de Hunyuan3D: {err}") from err
 
         self._model = pipeline
-        print(f"[Hunyuan3DGGUFGenerator] ✅ Modelo cargado correctamente en memoria.")
+        print(f"[Hunyuan3DGGUFGenerator] Modelo cargado correctamente en memoria.")
 
     def unload(self) -> None:
         """Libera la VRAM/RAM asignada al modelo."""
