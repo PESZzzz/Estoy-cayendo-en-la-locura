@@ -151,13 +151,13 @@ class Hunyuan3DDiTPipeline:
                     break
 
         if dit_gguf_path and os.path.exists(dit_gguf_path):
-            logger.info(f"[MODLY-GGUF] 🚀 Cargando DiT (Core MM-DiT) desde: {dit_gguf_path}")
+            logger.info(f"[MODLY-GGUF] Cargando DiT (Core MM-DiT) desde: {dit_gguf_path}")
             try:
                 gguf_sd = _load_gguf_to_state_dict(dit_gguf_path, strip_prefix="model.", dtype=dtype)
                 missing, unexpected = model.load_state_dict(gguf_sd, strict=False)
-                logger.info(f"[MODLY-GGUF] ✅ DiT cargado con éxito. (Faltantes: {len(missing)})")
+                logger.info(f"[MODLY-GGUF] DiT cargado con éxito. (Faltantes: {len(missing)})")
             except Exception as e:
-                logger.warning(f"[MODLY-GGUF] ❌ Error en GGUF DiT ({e}). Intentando fallback...")
+                logger.warning(f"[MODLY-GGUF] Error en GGUF DiT ({e}). Intentando fallback...")
                 if 'model' in ckpt:
                     model.load_state_dict(ckpt['model'], strict=False)
         elif 'model' in ckpt:
@@ -168,13 +168,13 @@ class Hunyuan3DDiTPipeline:
         vae_gguf_path = os.path.join(model_dir, "pig_3d_vae_fp32-f16.gguf")
         
         if os.path.exists(vae_gguf_path):
-            logger.info(f"[MODLY-GGUF] 🐷 Cargando Pig VAE (Latent Dim 64) desde: {vae_gguf_path}")
+            logger.info(f"[MODLY-GGUF] Cargando Pig VAE (Latent Dim 64) desde: {vae_gguf_path}")
             try:
                 vae_sd = _load_gguf_to_state_dict(vae_gguf_path, strip_prefix="vae.", dtype=dtype)
                 vae.load_state_dict(vae_sd, strict=False)
-                logger.info("[MODLY-GGUF] ✅ Pig VAE cargado exitosamente.")
+                logger.info("[MODLY-GGUF] Pig VAE cargado exitosamente.")
             except Exception as e:
-                logger.warning(f"[MODLY-GGUF] ⚠️ Error en Pig VAE: {e}")
+                logger.warning(f"[MODLY-GGUF] Error en Pig VAE: {e}")
                 if 'vae' in ckpt:
                     vae.load_state_dict(ckpt['vae'], strict=False)
         elif 'vae' in ckpt:
@@ -185,14 +185,14 @@ class Hunyuan3DDiTPipeline:
         vision_path = os.path.join(model_dir, "hy-3d-vision.safetensors")
         
         if os.path.exists(vision_path):
-            logger.info(f"[MODLY-GGUF] 👁️ Cargando Vision Encoder desde: {vision_path}")
+            logger.info(f"[MODLY-GGUF] Cargando Vision Encoder desde: {vision_path}")
             try:
                 import safetensors.torch
                 vision_weights = safetensors.torch.load_file(vision_path, device='cpu')
                 conditioner.load_state_dict(vision_weights, strict=False)
-                logger.info("[MODLY-GGUF] ✅ Vision Encoder cargado exitosamente.")
+                logger.info("[MODLY-GGUF] Vision Encoder cargado exitosamente.")
             except Exception as e:
-                logger.warning(f"[MODLY-GGUF] ⚠️ Error en Vision Encoder: {e}")
+                logger.warning(f"[MODLY-GGUF] Error en Vision Encoder: {e}")
                 if 'conditioner' in ckpt:
                     conditioner.load_state_dict(ckpt['conditioner'], strict=False)
         elif 'conditioner' in ckpt:
@@ -361,7 +361,7 @@ class Hunyuan3DDiTPipeline:
             cond = cat_recursive(cond, un_cond)
         return cond
 
-     me prepare_extra_step_kwargs(self, generator, eta):
+    def prepare_extra_step_kwargs(self, generator, eta):
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
         extra_step_kwargs = {}
         if accepts_eta:
