@@ -1,0 +1,89 @@
+{
+  "id": "hunyuan3d-v2",
+  "name": "Hunyuan3D 2",
+  "type": "model",
+  "source": "https://github.com/PESZzzz/Estoy-cayendo-en-la-locura",
+  "description": "Hunyuan3D 2 generator for Modly.",
+  "version": "1.0.0",
+  "author": "Modly Community",
+  "generator_class": "Hunyuan3DGenerator",
+  "tags": [
+    "image-to-3d",
+    "hunyuan3d",
+    "3d",
+    "amd-friendly"
+  ],
+  "nodes": [
+    {
+      "id": "generate",
+      "name": "Generate Mesh",
+      "label": "Generate Mesh",
+      "type": "generator",
+      "input": "image",
+      "output": "mesh",
+      "download_check": "hunyuan3d-dit-v2-0",
+      "params_schema": [
+        {
+          "id": "num_inference_steps",
+          "label": "Quality",
+          "type": "select",
+          "default": 30,
+          "options": [
+            { "value": 15, "label": "Fast" },
+            { "value": 30, "label": "Balanced" },
+            { "value": 50, "label": "High" }
+          ],
+          "tooltip": "Number of diffusion steps."
+        },
+        {
+          "id": "octree_resolution",
+          "label": "Mesh Resolution",
+          "type": "select",
+          "default": 384,
+          "options": [
+            { "value": 256, "label": "Low (256)" },
+            { "value": 384, "label": "Medium (384)" },
+            { "value": 512, "label": "High (512)" }
+          ],
+          "tooltip": "Octree resolution for mesh reconstruction."
+        },
+        {
+          "id": "enable_texture",
+          "label": "Generate Texture",
+          "type": "boolean",
+          "default": false,
+          "tooltip": "Generate textures after creating the mesh."
+        },
+        {
+          "id": "vertex_count",
+          "label": "Max Vertices (Decimation)",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 500000,
+          "step": 1000,
+          "tooltip": "Target vertex count. 0 disables decimation."
+        },
+        {
+          "id": "guidance_scale",
+          "label": "Guidance Scale",
+          "type": "float",
+          "default": 5.0,
+          "min": 1,
+          "max": 10,
+          "step": 0.5,
+          "tooltip": "Classifier-free guidance strength."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 2147483647,
+          "tooltip": "Seed for reproducibility."
+        }
+      ]
+    }
+  ]
+}
