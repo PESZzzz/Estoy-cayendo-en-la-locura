@@ -1,6 +1,5 @@
 """
-Custom GGUF Hybrid implementation for Modly
-Streamlined Generator (Post-setup execution)
+Hunyuan3D 2 Generator for Modly (Optimized)
 """
 import gc
 import io
@@ -18,31 +17,25 @@ from PIL import Image
 
 from services.generators.base import BaseGenerator, smooth_progress, GenerationCancelled
 
-_DIT_SUBFOLDER = "hunyuan3d-dit-v2-0"
-_GGUF_FILE_NAME = "hy-3d_fp32-q4_k_m.gguf"
 _PAINT_SUBFOLDER = "hunyuan3d-paint-v2-0-turbo"
+_DIT_SUBFOLDER = "hunyuan3d-dit-v2-0"
 
 
-class Hunyuan3DGGUFGenerator(BaseGenerator):
-    MODEL_ID     = "hunyuan3d-v2-gguf"
-    DISPLAY_NAME = "Hunyuan3D 2 (GGUF Q4)"
-    VRAM_GB      = 6
+class Hunyuan3DGenerator(BaseGenerator):
+    MODEL_ID = "hunyuan3d-v2"
+    DISPLAY_NAME = "Hunyuan3D 2"
+    VRAM_GB = 6
 
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
 
     def is_downloaded(self) -> bool:
-        """Modly comprueba si los archivos requeridos del modelo están en disco."""
-        model_dir = self.model_dir / _DIT_SUBFOLDER if (self.model_dir / _DIT_SUBFOLDER).exists() else self.model_dir
-        if not model_dir.exists():
-            return False
-        
-        # Verificar presencia de archivo GGUF para DiT y configuración base
-        has_config = (model_dir / "config.yaml").exists()
-        has_gguf = any(f.name.endswith('.gguf') for f in model_dir.iterdir()) if model_dir.is_dir() else False
-        
-        return has_config and has_gguf
+        model_dir = self.model_dir / _DIT_SUBFOLDER
+        return (
+            model_dir.exists()
+            and (model_dir / "model.fp16.safetensors").exists()
+        )
 
     def load(self) -> None:
         """Carga el pipeline a memoria usando el motor hy3dgen parcheado."""
@@ -98,26 +91,24 @@ class Hunyuan3DGGUFGenerator(BaseGenerator):
 
         target_dir  = self.model_dir / _DIT_SUBFOLDER if (self.model_dir / _DIT_SUBFOLDER).exists() else self.model_dir
         config_path = target_dir / "config.yaml"
-        gguf_path   = target_dir / _GGUF_FILE_NAME
 
-        ckpt_target = str(gguf_path) if gguf_path.exists() else str(target_dir)
-
-        print(f"[Hunyuan3DGGUFGenerator] 🚀 Cargando Pipeline GGUF Híbrido ({device}, {dtype}) desde: {ckpt_target}")
+        print(f"[Hunyuan3DGGUFGenerator] Cargando Pipeline GGUF Híbrido ({device}, {dtype}) desde: {target_dir}")
         
         # 3. Instanciación desde el pipeline refactorizado
         try:
-            pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
-                ckpt_path=ckpt_target,
-                config_path=str(config_path),
+            pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+                str(self.model_dir),
+                subfolder=_DIT_SUBFOLDER,
+                use_safetensors=True,
                 device=device,
                 dtype=dtype,
             )
         except Exception as err:
-            print(f"[Hunyuan3DGGUFGenerator] ❌ ERROR CRÍTICO al inicializar pipeline: {err}")
+            print(f"[Hunyuan3DGGUFGenerator] ERROR CRÍTICO al inicializar pipeline: {err}")
             raise RuntimeError(f"Fallo al instanciar el modelo GGUF de Hunyuan3D: {err}") from err
 
         self._model = pipeline
-        print(f"[Hunyuan3DGGUFGenerator] ✅ Modelo cargado correctamente en memoria.")
+        print(f"[Hunyuan3DGGUFGenerator] Modelo cargado correctamente en memoria.")
 
     def unload(self) -> None:
         """Libera la VRAM/RAM asignada al modelo."""
@@ -174,14 +165,14 @@ class Hunyuan3DGGUFGenerator(BaseGenerator):
 
         # 2. Generación de Geometría Base (Trimesh Output)
         try:
-            with torch.no_grad():
+            with torch.inference_mode():
                 generator = torch.Generator().manual_seed(seed)
                 outputs = self._model(
                     image=image,
                     num_inference_steps=num_steps,
                     octree_resolution=octree_res,
                     guidance_scale=guidance_scale,
-                    num_chunks=65536,
+                    num_chunks=4000,
                     generator=generator,
                     output_type="trimesh",
                 )
@@ -251,7 +242,7 @@ class Hunyuan3DGGUFGenerator(BaseGenerator):
             tmp.close()
 
             self._report(progress_cb, 83, "Generando mapa de texturas UV...")
-            with torch.no_grad():
+            with torch.inference_mode():
                 result = paint_pipeline(mesh, image=tmp.name)
         finally:
             if os.path.exists(tmp.name):

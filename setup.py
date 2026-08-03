@@ -1,7 +1,7 @@
 """
-Hunyuan3D 2 Mini (GGUF) — Extension setup script for Modly.
-Streamlined build: Uses custom GitHub patched code + Direct HF downloader (Vision + GGUF + Pig VAE)
-+ Auto-organizes models in Documents/Modly/models/hunyuan3d-v2-gguf.
+Hunyuan3D 2 (Official Clean) — Extension setup script for Modly.
+Direct HF downloader for official Hunyuan3D-2 models (.safetensors).
+Auto-organizes models in Documents/Modly/models/hunyuan3d-v2.
 """
 
 import json
@@ -15,17 +15,16 @@ from pathlib import Path
 # ------------------------------------------------------------------ #
 # Constantes y Parámetros
 # ------------------------------------------------------------------ #
-EXTENSION_NAME = "hunyuan3d-v2-gguf"
+EXTENSION_NAME = "hunyuan3d-v2"
 
-# Repositorio correcto de Calcuis en HF
-CALCUIS_REPO_ID = "calcuis/hy3d-gguf" 
+# Repositorio oficial de Hunyuan3D-2 en Hugging Face
+HUNYUAN_REPO_ID = "tencent/Hunyuan3D-2" 
 TARGET_SUBFOLDER = Path("generate") / "hunyuan3d-dit-v2-0"
 
-# Archivos indispensables de la trinidad
+# Archivos oficiales del modelo DiT V2
 MODEL_FILES = [
-    "hy-3d-vision.safetensors",
-    "hy-3d_fp32-q4_k_m.gguf",
-    "pig_3d_vae_fp32-f16.gguf"
+    "config.yaml",
+    "model.fp16.safetensors"
 ]
 
 PACKAGES = [
@@ -43,30 +42,24 @@ PACKAGES = [
     "einops",
     "scipy",
     "scikit-image",
-    "gguf",
-    "ninja",
     "rembg",
-    "onnxruntime",
+    "mcubes",
 ]
-
 
 def log(msg: str) -> None:
     print(f"[setup] {msg}")
 
-
 def get_python(venv: Path) -> Path:
     is_win = platform.system() == "Windows"
     return venv / ("Scripts/python.exe" if is_win else "bin/python")
-
 
 def pip(venv: Path, *args: str) -> None:
     """Ejecuta pip a través del binario de Python para evitar bloqueos de archivo en Windows."""
     python_exe = get_python(venv)
     subprocess.run([str(python_exe), "-m", "pip", *args], check=True)
 
-
 def download_models(ext_dir: Path, venv: Path) -> None:
-    """Descarga los modelos reales (Vision, GGUF y Pig VAE) desde HF si no existen o si son punteros corruptos/LFS de 1KB."""
+    """Descarga los modelos oficiales (.safetensors) desde Hugging Face."""
     target_dir = ext_dir / TARGET_SUBFOLDER
     target_dir.mkdir(parents=True, exist_ok=True)
     python_venv = get_python(venv)
@@ -74,32 +67,32 @@ def download_models(ext_dir: Path, venv: Path) -> None:
     for file_name in MODEL_FILES:
         target_file = target_dir / file_name
 
-        # Si el archivo existe pero pesa menos de 1 MB, asumimos que es un puntero LFS corrupto y lo borramos
+        # Si el archivo existe pero pesa menos de 1 MB (y no es el yaml), se asume corrupto
         if target_file.exists():
-            if target_file.stat().st_size < 1024 * 1024:
-                log(f"El archivo {file_name} parece ser un puntero Git LFS de pocos KB. Eliminando para redescargar...")
+            if target_file.stat().st_size < 1024 * 1024 and not file_name.endswith('.yaml'):
+                log(f"El archivo {file_name} parece estar incompleto o corrupto. Eliminando para redescargar...")
                 target_file.unlink()
             else:
-                log(f"El archivo {file_name} ya está presente y válido en: {target_file}")
+                log(f"El archivo {file_name} ya está presente en: {target_file}")
                 continue
 
-        log(f"Descargando {file_name} desde Hugging Face ({CALCUIS_REPO_ID})...")
+        log(f"Descargando {file_name} desde Hugging Face ({HUNYUAN_REPO_ID})...")
 
         download_script = (
             f"from huggingface_hub import hf_hub_download\n"
             f"hf_hub_download("
-            f"repo_id='{CALCUIS_REPO_ID}', "
+            f"repo_id='{HUNYUAN_REPO_ID}', "
             f"filename='{file_name}', "
-            f"local_dir=r'{target_dir}', "
+            f"subfolder='hunyuan3d-dit-v2-0', "
+            f"local_dir=r'{target_dir.parent}', "
             f"local_dir_use_symlinks=False)\n"
         )
 
         subprocess.run([str(python_venv), "-c", download_script], check=True)
         log(f"Descarga de {file_name} completada exitosamente.")
 
-
 def sync_to_modly_models(ext_dir: Path) -> None:
-    """Asegura que la carpeta generate/ quede ubicada en Documents/Modly/models/hunyuan3d-v2-gguf."""
+    """Asegura que la carpeta generate/ quede ubicada en Documents/Modly/models/hunyuan3d-v2."""
     modly_models_dir = Path.home() / "Documents" / "Modly" / "models" / EXTENSION_NAME
     local_generate = ext_dir / "generate"
 
@@ -112,7 +105,7 @@ def sync_to_modly_models(ext_dir: Path) -> None:
 
     target_generate = modly_models_dir / "generate"
 
-    # Si la carpeta destino ya existe, sincronizamos/copiamos el contenido
+    # Si la carpeta destino ya existe, sincronizamos el contenido
     if target_generate.exists():
         log("La carpeta 'generate' ya existe en Modly models. Actualizando contenido...")
         shutil.copytree(local_generate, target_generate, dirs_exist_ok=True)
@@ -121,7 +114,6 @@ def sync_to_modly_models(ext_dir: Path) -> None:
         shutil.move(str(local_generate), str(target_generate))
 
     log("Directorio de modelos sincronizado con éxito.")
-
 
 def setup(
     python_exe: str,
@@ -134,7 +126,7 @@ def setup(
 ) -> None:
     venv = ext_dir / "venv"
 
-    log(f"Iniciando configuración en {ext_dir}")
+    log(f"Iniciando configuración limpia de Hunyuan3D-2 en {ext_dir}")
     log(f"Creando entorno virtual (venv) en {venv}...")
     subprocess.run([python_exe, "-m", "venv", str(venv)], check=True)
 
@@ -160,14 +152,13 @@ def setup(
     except Exception as e:
         log(f"Aviso al crear el enlace .pth: {e}")
 
-    # 3. Descargar la trinidad completa de modelos directamente vía HF Hub
+    # 3. Descargar modelos oficiales de Tencent
     download_models(ext_dir, venv)
 
-    # 4. Mover/Sincronizar 'generate' a Documents/Modly/models/hunyuan3d-v2-gguf
+    # 4. Mover/Sincronizar 'generate' a Documents/Modly/models/hunyuan3d-v2
     sync_to_modly_models(ext_dir)
 
-    log("¡Setup finalizado con éxito! La extensión y sus modelos están en su lugar.")
-
+    log("¡Setup finalizado con éxito! Hunyuan3D-2 oficial está listo para usar.")
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4:
