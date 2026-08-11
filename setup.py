@@ -27,17 +27,10 @@ MODEL_FILES = [
     "model.fp16.safetensors"
 ]
 
-# Install in TWO phases:
-# Phase 1: torch first (diso needs it to compile)
-# Phase 2: everything else
-# Phase 3: diso last (optional, may fail on some systems)
-
-PACKAGES_PHASE1 = [
+# Core dependencies (always installed)
+PACKAGES_CORE = [
     "torch",
     "torchvision",
-]
-
-PACKAGES_PHASE2 = [
     "Pillow",
     "numpy",
     "trimesh",
@@ -54,9 +47,11 @@ PACKAGES_PHASE2 = [
     "mcubes",
 ]
 
-PACKAGES_PHASE3 = [
-    "diso",  # Dual Marching Cubes -- needs torch to compile
-]
+# diso is a fast Dual Marching Cubes implementation.
+# It requires torch + a C++ compiler to build from source.
+# On Windows this is extremely unreliable, so we skip it automatically.
+# On Linux it usually installs fine from pre-built wheels.
+_IS_WINDOWS = platform.system() == "Windows"
 
 def log(msg: str) -> None:
     print(f"[setup] {msg}")
@@ -148,29 +143,27 @@ def setup(
     python_venv = get_python(venv)
     subprocess.run([str(python_venv), "-m", "pip", "install", "--upgrade", "pip"], check=True)
 
-    # Phase 1: Install torch first (diso needs it to compile)
-    log("Phase 1/3: Installing torch and torchvision...")
-    if not pip(venv, "install", *PACKAGES_PHASE1):
-        log("ERROR: Failed to install torch. Setup cannot continue.")
+    # Phase 1: Install all core dependencies
+    log("Installing core dependencies...")
+    if not pip(venv, "install", *PACKAGES_CORE):
+        log("ERROR: Failed to install core dependencies. Setup cannot continue.")
         sys.exit(1)
 
-    # Phase 2: Install remaining dependencies
-    log("Phase 2/3: Installing remaining dependencies...")
-    if not pip(venv, "install", *PACKAGES_PHASE2):
-        log("ERROR: Failed to install core dependencies.")
-        sys.exit(1)
-
-    # Phase 3: Install diso (optional -- needs torch + MSVC on Windows)
-    log("Phase 3/3: Installing diso (Dual Marching Cubes optimizer)...")
-    if pip(venv, "install", *PACKAGES_PHASE3):
-        log("diso installed successfully! You can use mc_algo='dmc' for faster mesh extraction.")
+    # Phase 2: Optional -- install diso for faster mesh extraction
+    # Only attempt on Linux. On Windows it requires MSVC + torch at build time
+    # which pip cannot guarantee, causing confusing errors for users.
+    if _IS_WINDOWS:
+        log("Skipping 'diso' on Windows (requires C++ compiler, unreliable via pip).")
+        log("Standard marching cubes (mc_algo='mc') will be used.")
+        log("If you want DMC later, install Visual Studio Build Tools with C++ workload,")
+        log("open 'x64 Native Tools Command Prompt', and run:")
+        log("  pip install diso --no-build-isolation")
     else:
-        log("WARNING: diso installation failed. This is usually because:")
-        log("  - MSVC Build Tools are not installed (required on Windows)")
-        log("  - No compatible CUDA toolkit found")
-        log("Falling back to standard marching cubes (mc_algo='mc').")
-        log("To enable DMC later, install Visual Studio Build Tools with C++ workload,")
-        log("then run: pip install diso")
+        log("Attempting to install 'diso' for faster Dual Marching Cubes...")
+        if pip(venv, "install", "diso"):
+            log("diso installed! You can use mc_algo='dmc' for faster mesh extraction.")
+        else:
+            log("WARNING: diso installation failed. Falling back to mc_algo='mc'.")
 
     # 2. Link .pth
     log("Linking extension to Python environment (.pth)...")
