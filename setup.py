@@ -27,9 +27,17 @@ MODEL_FILES = [
     "model.fp16.safetensors"
 ]
 
-PACKAGES = [
+# Install in TWO phases:
+# Phase 1: torch first (diso needs it to compile)
+# Phase 2: everything else
+# Phase 3: diso last (optional, may fail on some systems)
+
+PACKAGES_PHASE1 = [
     "torch",
     "torchvision",
+]
+
+PACKAGES_PHASE2 = [
     "Pillow",
     "numpy",
     "trimesh",
@@ -44,7 +52,10 @@ PACKAGES = [
     "scikit-image",
     "rembg",
     "mcubes",
-    "diso",  # Dual Marching Cubes -- faster mesh extraction on CPU/GPU
+]
+
+PACKAGES_PHASE3 = [
+    "diso",  # Dual Marching Cubes -- needs torch to compile
 ]
 
 def log(msg: str) -> None:
@@ -54,10 +65,15 @@ def get_python(venv: Path) -> Path:
     is_win = platform.system() == "Windows"
     return venv / ("Scripts/python.exe" if is_win else "bin/python")
 
-def pip(venv: Path, *args: str) -> None:
-    """Run pip through the Python binary to avoid file locks on Windows."""
+def pip(venv: Path, *args: str) -> bool:
+    """Run pip through the Python binary. Returns True on success."""
     python_exe = get_python(venv)
-    subprocess.run([str(python_exe), "-m", "pip", *args], check=True)
+    try:
+        subprocess.run([str(python_exe), "-m", "pip", *args], check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        log(f"pip failed: {e}")
+        return False
 
 def download_models(ext_dir: Path, venv: Path) -> None:
     """Download official models (.safetensors) from Hugging Face."""
@@ -68,7 +84,6 @@ def download_models(ext_dir: Path, venv: Path) -> None:
     for file_name in MODEL_FILES:
         target_file = target_dir / file_name
 
-        # If file exists but is smaller than 1 MB (and not yaml), assume corrupt
         if target_file.exists():
             if target_file.stat().st_size < 1024 * 1024 and not file_name.endswith('.yaml'):
                 log(f"File {file_name} seems incomplete/corrupt. Deleting to re-download...")
@@ -106,7 +121,6 @@ def sync_to_modly_models(ext_dir: Path) -> None:
 
     target_generate = modly_models_dir / "generate"
 
-    # If destination exists, sync content
     if target_generate.exists():
         log("'generate' folder already exists in Modly models. Updating content...")
         shutil.copytree(local_generate, target_generate, dirs_exist_ok=True)
@@ -131,11 +145,32 @@ def setup(
     log(f"Creating virtual environment (venv) in {venv}...")
     subprocess.run([python_exe, "-m", "venv", str(venv)], check=True)
 
-    # 1. Install dependencies
-    log("Installing Python dependencies...")
     python_venv = get_python(venv)
     subprocess.run([str(python_venv), "-m", "pip", "install", "--upgrade", "pip"], check=True)
-    pip(venv, "install", *PACKAGES)
+
+    # Phase 1: Install torch first (diso needs it to compile)
+    log("Phase 1/3: Installing torch and torchvision...")
+    if not pip(venv, "install", *PACKAGES_PHASE1):
+        log("ERROR: Failed to install torch. Setup cannot continue.")
+        sys.exit(1)
+
+    # Phase 2: Install remaining dependencies
+    log("Phase 2/3: Installing remaining dependencies...")
+    if not pip(venv, "install", *PACKAGES_PHASE2):
+        log("ERROR: Failed to install core dependencies.")
+        sys.exit(1)
+
+    # Phase 3: Install diso (optional -- needs torch + MSVC on Windows)
+    log("Phase 3/3: Installing diso (Dual Marching Cubes optimizer)...")
+    if pip(venv, "install", *PACKAGES_PHASE3):
+        log("diso installed successfully! You can use mc_algo='dmc' for faster mesh extraction.")
+    else:
+        log("WARNING: diso installation failed. This is usually because:")
+        log("  - MSVC Build Tools are not installed (required on Windows)")
+        log("  - No compatible CUDA toolkit found")
+        log("Falling back to standard marching cubes (mc_algo='mc').")
+        log("To enable DMC later, install Visual Studio Build Tools with C++ workload,")
+        log("then run: pip install diso")
 
     # 2. Link .pth
     log("Linking extension to Python environment (.pth)...")
