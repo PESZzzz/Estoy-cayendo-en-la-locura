@@ -1,33 +1,89 @@
-# Hunyuan 3D is licensed under the TENCENT HUNYUAN NON-COMMERCIAL LICENSE AGREEMENT
-# except for the third-party components listed below.
-# Hunyuan 3D does not impose any additional limitations beyond what is outlined
-# in the repsective licenses of these third-party components.
-# Users must comply with all terms and conditions of original licenses of these third-party
-# components and must ensure that the usage of the third party components adheres to
-# all relevant laws and regulations.
-
-# For avoidance of doubts, Hunyuan 3D means the large language models and
-# their software and algorithms, including trained model weights, parameters (including
-# optimizer states), machine-learning model code, inference-enabling code, training-enabling code,
-# fine-tuning enabling code and other elements of the foregoing made publicly available
-# by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
+# Open Source Model Licensed under the Apache License Version 2.0
+# and Other Licenses of the Third-Party Components therein:
+# The below Model in this distribution may have been modified by THL A29 Limited
+# ("Tencent Modifications"). All Tencent Modifications are Copyright (C) 2024 THL A29 Limited.
 
 import copy
 import gc
 import importlib
 import inspect
 import os
+import shutil
+import sys
+import warnings
 from typing import List, Optional, Union
 
 import numpy as np
 import torch
-import os
 
-# ---------- CPU Optimization ----------
-torch.set_num_threads(os.cpu_count())
-torch.set_num_interop_threads(4)
+# ---------- Universal CPU/GPU Optimization ----------
+total_cores = os.cpu_count() or 4
+# Reserve 25% for OS and other apps (was 20%, increased for stability)
+safe_cores = max(1, int(total_cores * 0.75))
+
+torch.set_num_threads(safe_cores)
+torch.set_num_interop_threads(max(1, int(safe_cores // 2)))
+os.environ["OMP_NUM_THREADS"] = str(safe_cores)
+os.environ["MKL_NUM_THREADS"] = str(safe_cores)
+
+# Disable aggressive optimizations that crash on consumer hardware
 torch.backends.mkldnn.enabled = True
 torch.set_float32_matmul_precision("medium")
+
+# Disable torch.compile/dynamo globally for CPU/Windows without MSVC
+# This prevents "cl is not found" errors on AMD/Intel laptops
+
+def _find_msvc_cl():
+    """Search for cl.exe in common Visual Studio install paths."""
+    if shutil.which("cl"):
+        return True
+    # Common VS Build Tools paths
+    program_files = [r"C:\Program Files", r"C:\Program Files (x86)"]
+    years = ["2022", "2019", "2017"]
+    for pf in program_files:
+        for year in years:
+            base = os.path.join(pf, f"Microsoft Visual Studio\{year}\BuildTools\VC\Tools\MSVC")
+            if os.path.isdir(base):
+                # Find latest version subfolder
+                try:
+                    versions = sorted(os.listdir(base), reverse=True)
+                    for ver in versions:
+                        cl_path = os.path.join(base, ver, "bin", "Hostx64", "x64", "cl.exe")
+                        if os.path.isfile(cl_path):
+                            return True
+                except Exception:
+                    pass
+    return False
+
+_DISABLE_COMPILE = False
+if sys.platform == "win32" and not torch.cuda.is_available():
+    if not _find_msvc_cl():
+        _DISABLE_COMPILE = True
+        warnings.warn(
+            "MSVC compiler (cl.exe) not found. Disabling torch.compile() "
+            "for CPU inference on Windows. Install Visual Studio Build Tools "
+            "with 'Desktop development with C++' workload for faster inference.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+if _DISABLE_COMPILE:
+    # Disable dynamo completely to avoid lazy compilation crashes
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.reset()
+    # Monkey-patch torch.compile to be a no-op on CPU/Windows
+    _original_compile = torch.compile
+    def _noop_compile(model, *args, **kwargs):
+        warnings.warn(
+            "torch.compile() is disabled on this system (CPU/Windows without MSVC). "
+            "Inference will work but may be slower.",
+            UserWarning,
+            stacklevel=3,
+        )
+        return model
+    torch.compile = _noop_compile
+# ----------------------------------------------------
 
 import trimesh
 import yaml
@@ -42,7 +98,7 @@ from .utils import logger, synchronize_timer, smart_load_model
 
 
 def free_vram():
-    """Libera la memoria residual de la GPU para evitar bloqueos en portátiles y AMD."""
+    """Free residual GPU memory to prevent hangs on laptops and AMD."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -56,29 +112,6 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
-    """
-    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
-    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
-
-    Args:
-        scheduler (`SchedulerMixin`):
-            The scheduler to get timesteps from.
-        num_inference_steps (`int`):
-            The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
-            must be `None`.
-        device (`str` or `torch.device`, *optional*):
-            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
-        timesteps (`List[int]`, *optional*):
-            Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
-            `num_inference_steps` and `sigmas` must be `None`.
-        sigmas (`List[float]`, *optional*):
-            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
-            `num_inference_steps` and `timesteps` must be `None`.
-
-    Returns:
-        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
-        second element is the number of inference steps.
-    """
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
     if timesteps is not None:
@@ -163,11 +196,9 @@ class Hunyuan3DDiTPipeline:
         use_safetensors=None,
         **kwargs,
     ):
-        # load config
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
 
-        # load ckpt
         if use_safetensors:
             ckpt_path = ckpt_path.replace('.ckpt', '.safetensors')
         if not os.path.exists(ckpt_path):
@@ -175,7 +206,6 @@ class Hunyuan3DDiTPipeline:
         logger.info(f"Loading model from {ckpt_path}")
 
         if use_safetensors:
-            # parse safetensors
             import safetensors.torch
             safetensors_ckpt = safetensors.torch.load_file(ckpt_path, device='cpu')
             ckpt = {}
@@ -187,7 +217,7 @@ class Hunyuan3DDiTPipeline:
                 ckpt[model_name][new_key] = value
         else:
             ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
-        # load model
+
         model = instantiate_from_config(config['model'])
         model.load_state_dict(ckpt['model'])
         vae = instantiate_from_config(config['vae'])
@@ -209,9 +239,7 @@ class Hunyuan3DDiTPipeline:
         )
         model_kwargs.update(kwargs)
 
-        return cls(
-            **model_kwargs
-        )
+        return cls(**model_kwargs)
 
     @classmethod
     def from_pretrained(
@@ -264,67 +292,31 @@ class Hunyuan3DDiTPipeline:
         self.conditioner = conditioner
         self.image_processor = image_processor
         self.kwargs = kwargs
-        
-        # Flag de optimización extrema activado/desactivado
+
         self.manual_offload = False
         self.to(device, dtype)
 
-        if hasattr(torch, "compile"):
+        # Only attempt torch.compile if not disabled for this system
+        if not _DISABLE_COMPILE and hasattr(torch, "compile"):
             try:
+                logger.info("Attempting torch.compile() with reduce-overhead mode...")
                 self.model = torch.compile(self.model, mode="reduce-overhead")
-            except Exception:
-                pass
+                logger.info("torch.compile() applied successfully.")
+            except Exception as e:
+                logger.warning(f"torch.compile() failed: {e}. Continuing without compilation.")
+        elif _DISABLE_COMPILE:
+            logger.info("torch.compile() is disabled for this system configuration.")
 
     def enable_sequential_offload(self, enabled: bool = True):
-        """Activa el sistema manual y agresivo de offload CPU <-> GPU"""
         self.manual_offload = enabled
 
     def compile(self):
+        if _DISABLE_COMPILE:
+            logger.warning("compile() skipped: torch.compile is disabled on this system.")
+            return
         self.vae = torch.compile(self.vae)
         self.model = torch.compile(self.model)
         self.conditioner = torch.compile(self.conditioner)
-
-    def enable_flashvdm(
-        self,
-        enabled: bool = True,
-        adaptive_kv_selection=True,
-        topk_mode='mean',
-        mc_algo='mc',
-        replace_vae=True,
-    ):
-        if enabled:
-            model_path = self.kwargs['from_pretrained_kwargs']['model_path']
-            turbo_vae_mapping = {
-                'Hunyuan3D-2': ('tencent/Hunyuan3D-2', 'hunyuan3d-vae-v2-0-turbo'),
-                'Hunyuan3D-2mv': ('tencent/Hunyuan3D-2', 'hunyuan3d-vae-v2-0-turbo'),
-                'Hunyuan3D-2mini': ('tencent/Hunyuan3D-2mini', 'hunyuan3d-vae-v2-mini-turbo'),
-            }
-            model_name = model_path.split('/')[-1]
-            if replace_vae and model_name in turbo_vae_mapping:
-                model_path, subfolder = turbo_vae_mapping[model_name]
-                self.vae = ShapeVAE.from_pretrained(
-                    model_path, subfolder=subfolder,
-                    use_safetensors=self.kwargs['from_pretrained_kwargs']['use_safetensors'],
-                    device=self.device,
-                )
-            self.vae.enable_flashvdm_decoder(
-                enabled=enabled,
-                adaptive_kv_selection=adaptive_kv_selection,
-                topk_mode=topk_mode,
-                mc_algo=mc_algo
-            )
-        else:
-            model_path = self.kwargs['from_pretrained_kwargs']['model_path']
-            vae_mapping = {
-                'Hunyuan3D-2': ('tencent/Hunyuan3D-2', 'hunyuan3d-vae-v2-0'),
-                'Hunyuan3D-2mv': ('tencent/Hunyuan3D-2', 'hunyuan3d-vae-v2-0'),
-                'Hunyuan3D-2mini': ('tencent/Hunyuan3D-2mini', 'hunyuan3d-vae-v2-mini'),
-            }
-            model_name = model_path.split('/')[-1]
-            if model_name in vae_mapping:
-                model_path, subfolder = vae_mapping[model_name]
-                self.vae = ShapeVAE.from_pretrained(model_path, subfolder=subfolder)
-            self.vae.enable_flashvdm_decoder(enabled=False)
 
     def to(self, device=None, dtype=None):
         if dtype is not None:
@@ -338,121 +330,8 @@ class Hunyuan3DDiTPipeline:
             self.model.to(device)
             self.conditioner.to(device)
 
-    @property
-    def _execution_device(self):
-        r"""
-        Returns the device on which the pipeline's models will be executed. After calling
-        [`~DiffusionPipeline.enable_sequential_cpu_offload`] the execution device can only be inferred from
-        Accelerate's module hooks.
-        """
-        for name, model in self.components.items():
-            if not isinstance(model, torch.nn.Module) or name in self._exclude_from_cpu_offload:
-                continue
-
-            if not hasattr(model, "_hf_hook"):
-                return self.device
-            for module in model.modules():
-                if (
-                    hasattr(module, "_hf_hook")
-                    and hasattr(module._hf_hook, "execution_device")
-                    and module._hf_hook.execution_device is not None
-                ):
-                    return torch.device(module._hf_hook.execution_device)
-        return self.device
-
-    def enable_model_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = "cuda"):
-        r"""
-        Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance. Compared
-        to `enable_sequential_cpu_offload`, this method moves one whole model at a time to the GPU when its `forward`
-        method is called, and the model remains in GPU until the next model runs. Memory savings are lower than with
-        `enable_sequential_cpu_offload`, but performance is much better due to the iterative execution of the `unet`.
-
-        Arguments:
-            gpu_id (`int`, *optional*):
-                The ID of the accelerator that shall be used in inference. If not specified, it will default to 0.
-            device (`torch.Device` or `str`, *optional*, defaults to "cuda"):
-                The PyTorch device type of the accelerator that shall be used in inference. If not specified, it will
-                default to "cuda".
-        """
-        if self.model_cpu_offload_seq is None:
-            raise ValueError(
-                "Model CPU offload cannot be enabled because no `model_cpu_offload_seq` class attribute is set."
-            )
-
-        if is_accelerate_available() and is_accelerate_version(">=", "0.17.0.dev0"):
-            from accelerate import cpu_offload_with_hook
-        else:
-            raise ImportError("`enable_model_cpu_offload` requires `accelerate v0.17.0` or higher.")
-
-        torch_device = torch.device(device)
-        device_index = torch_device.index
-
-        if gpu_id is not None and device_index is not None:
-            raise ValueError(
-                f"You have passed both `gpu_id`={gpu_id} and an index as part of the passed device `device`={device}"
-                f"Cannot pass both. Please make sure to either not define `gpu_id` or not pass the index as part of the device: `device`={torch_device.type}"
-            )
-
-        # _offload_gpu_id should be set to passed gpu_id (or id in passed `device`) or default to previously set id or default to 0
-        self._offload_gpu_id = gpu_id or torch_device.index or getattr(self, "_offload_gpu_id", 0)
-
-        device_type = torch_device.type
-        device = torch.device(f"{device_type}:{self._offload_gpu_id}")
-
-        if self.device.type != "cpu":
-            self.to("cpu")
-            device_mod = getattr(torch, self.device.type, None)
-            if hasattr(device_mod, "empty_cache") and device_mod.is_available():
-                device_mod.empty_cache()  # otherwise we don't see the memory savings (but they probably exist)
-
-        all_model_components = {k: v for k, v in self.components.items() if isinstance(v, torch.nn.Module)}
-
-        self._all_hooks = []
-        hook = None
-        for model_str in self.model_cpu_offload_seq.split("->"):
-            model = all_model_components.pop(model_str, None)
-            if not isinstance(model, torch.nn.Module):
-                continue
-
-            _, hook = cpu_offload_with_hook(model, device, prev_module_hook=hook)
-            self._all_hooks.append(hook)
-
-        # CPU offload models that are not in the seq chain unless they are explicitly excluded
-        # these models will stay on CPU until maybe_free_model_hooks is called
-        # some models cannot be in the seq chain because they are iteratively called, such as controlnet
-        for name, model in all_model_components.items():
-            if not isinstance(model, torch.nn.Module):
-                continue
-
-            if name in self._exclude_from_cpu_offload:
-                model.to(device)
-            else:
-                _, hook = cpu_offload_with_hook(model, device)
-                self._all_hooks.append(hook)
-
-    def maybe_free_model_hooks(self):
-        r"""
-        Function that offloads all components, removes all model hooks that were added when using
-        `enable_model_cpu_offload` and then applies them again. In case the model has not been offloaded this function
-        is a no-op. Make sure to add this function to the end of the `__call__` function of your pipeline so that it
-        functions correctly when applying enable_model_cpu_offload.
-        """
-        if not hasattr(self, "_all_hooks") or len(self._all_hooks) == 0:
-            # `enable_model_cpu_offload` has not be called, so silently do nothing
-            return
-
-        for hook in self._all_hooks:
-            # offload model and remove hook from model
-            hook.offload()
-            hook.remove()
-
-        # make sure the model is in the same state as before calling it
-        self.enable_model_cpu_offload()
-
     @synchronize_timer('Encode cond')
     def encode_cond(self, image, additional_cond_inputs, do_classifier_free_guidance, dual_guidance):
-        
-        # Offload logic: Traemos el conditioner a VRAM solo si está activado
         if getattr(self, "manual_offload", False):
             self.conditioner.to(self.device)
 
@@ -485,8 +364,7 @@ class Hunyuan3DDiTPipeline:
                     return out
 
                 cond = cat_recursive(cond, un_cond)
-        
-        # Offload logic: Lo limpiamos una vez terminó
+
         if getattr(self, "manual_offload", False):
             self.conditioner.to("cpu")
             free_vram()
@@ -494,17 +372,11 @@ class Hunyuan3DDiTPipeline:
         return cond
 
     def prepare_extra_step_kwargs(self, generator, eta):
-        # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
-        # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
-        # and should be between [0, 1]
-
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
         extra_step_kwargs = {}
         if accepts_eta:
             extra_step_kwargs["eta"] = eta
 
-        # check if the scheduler accepts generator
         accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
         if accepts_generator:
             extra_step_kwargs["generator"] = generator
@@ -512,25 +384,15 @@ class Hunyuan3DDiTPipeline:
 
     def prepare_latents(self, batch_size, dtype, device, generator, latents=None):
         shape = (batch_size, *self.vae.latent_shape)
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-            )
-
         if latents is None:
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         else:
             latents = latents.to(device)
 
-        # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * getattr(self.scheduler, 'init_noise_sigma', 1.0)
         return latents
 
     def prepare_image(self, image) -> dict:
-        if isinstance(image, str) and not os.path.exists(image):
-            raise FileNotFoundError(f"Couldn't find image at path {image}")
-
         if not isinstance(image, list):
             image = [image]
 
@@ -550,40 +412,19 @@ class Hunyuan3DDiTPipeline:
         return cond_input
 
     def get_guidance_scale_embedding(self, w, embedding_dim=512, dtype=torch.float32):
-        """
-        See https://github.com/google-research/vdm/blob/dc27b98a554f65cdc654b800da5aa1846545d41b/model_vdm.py#L298
-
-        Args:
-            timesteps (`torch.Tensor`):
-                generate embedding vectors at these timesteps
-            embedding_dim (`int`, *optional*, defaults to 512):
-                dimension of the embeddings to generate
-            dtype:
-                data type of the generated embeddings
-
-        Returns:
-            `torch.FloatTensor`: Embedding vectors with shape `(len(timesteps), embedding_dim)`
-        """
-        assert len(w.shape) == 1
         w = w * 1000.0
-
         half_dim = embedding_dim // 2
         emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, dtype=dtype) * -emb)
         emb = w.to(dtype)[:, None] * emb[None, :]
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-        if embedding_dim % 2 == 1:  # zero pad
+        if embedding_dim % 2 == 1:
             emb = torch.nn.functional.pad(emb, (0, 1))
-        assert emb.shape == (w.shape[0], embedding_dim)
         return emb
 
     def set_surface_extractor(self, mc_algo):
         if mc_algo is None:
             return
-        logger.info('The parameters `mc_algo` is deprecated, and will be removed in future versions.\n'
-                    'Please use: \n'
-                    'from hy3dgen.shapegen.models.autoencoders import SurfaceExtractors\n'
-                    'pipeline.vae.surface_extractor = SurfaceExtractors[mc_algo]() instead\n')
         if mc_algo not in SurfaceExtractors.keys():
             raise ValueError(f"Unknown mc_algo {mc_algo}")
         self.vae.surface_extractor = SurfaceExtractors[mc_algo]()
@@ -603,7 +444,7 @@ class Hunyuan3DDiTPipeline:
         box_v=1.01,
         octree_resolution=384,
         mc_level=-1 / 512,
-        num_chunks=8000,
+        num_chunks=2000,
         mc_algo=None,
         output_type: Optional[str] = "trimesh",
         enable_pbar=True,
@@ -613,11 +454,9 @@ class Hunyuan3DDiTPipeline:
         callback_steps = kwargs.pop("callback_steps", None)
 
         self.set_surface_extractor(mc_algo)
-
         device = self.device
         dtype = self.dtype
-        do_classifier_free_guidance = guidance_scale >= 0 and \
-                                      getattr(self.model, 'guidance_cond_proj_dim', None) is None
+        do_classifier_free_guidance = guidance_scale >= 0 and getattr(self.model, 'guidance_cond_proj_dim', None) is None
         dual_guidance = dual_guidance_scale >= 0 and dual_guidance
 
         cond_inputs = self.prepare_image(image)
@@ -629,41 +468,33 @@ class Hunyuan3DDiTPipeline:
             dual_guidance=False,
         )
         batch_size = image.shape[0]
-
         t_dtype = torch.long
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler, num_inference_steps, device, timesteps, sigmas)
-
+        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps, sigmas)
         latents = self.prepare_latents(batch_size, dtype, device, generator)
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         guidance_cond = None
         if getattr(self.model, 'guidance_cond_proj_dim', None) is not None:
-            logger.info('Using lcm guidance scale')
             guidance_scale_tensor = torch.tensor(guidance_scale - 1).repeat(batch_size)
             guidance_cond = self.get_guidance_scale_embedding(
                 guidance_scale_tensor, embedding_dim=self.model.guidance_cond_proj_dim
             ).to(device=device, dtype=latents.dtype)
 
-        # Offload logic: Preparamos la GPU para la generación DiT
         if getattr(self, "manual_offload", False):
             self.model.to(device)
 
         with synchronize_timer('Diffusion Sampling'):
             for i, t in enumerate(tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:", leave=False)):
-                # expand the latents if we are doing classifier free guidance
                 if do_classifier_free_guidance:
                     latent_model_input = torch.cat([latents] * (3 if dual_guidance else 2))
                 else:
                     latent_model_input = latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # predict the noise residual
                 timestep_tensor = t.expand(latent_model_input.shape[0]).to(dtype=t_dtype)
                 timestep_tensor = timestep_tensor.expand(latent_model_input.shape[0])
                 noise_pred = self.model(latent_model_input, timestep_tensor, cond, guidance_cond=guidance_cond)
 
-                # no drop, drop clip, all drop
                 if do_classifier_free_guidance:
                     if dual_guidance:
                         noise_pred_clip, noise_pred_dino, noise_pred_uncond = noise_pred.chunk(3)
@@ -676,15 +507,13 @@ class Hunyuan3DDiTPipeline:
                         noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-                # compute the previous noisy sample x_t -> x_t-1
                 outputs = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
                 latents = outputs.prev_sample
 
                 if callback is not None and i % callback_steps == 0:
                     step_idx = i // getattr(self.scheduler, "order", 1)
                     callback(step_idx, t, outputs)
-        
-        # Offload logic: El DiT terminó, limpiamos
+
         if getattr(self, "manual_offload", False):
             self.model.to("cpu")
             free_vram()
@@ -701,15 +530,36 @@ class Hunyuan3DDiTPipeline:
         output_type='trimesh',
         box_v=1.01,
         mc_level=0.0,
-        num_chunks=20000,
+        num_chunks=2000,
         octree_resolution=256,
         mc_algo='mc',
         enable_pbar=True
     ):
         if not output_type == "latent":
-            # Offload logic: Subimos el VAE a VRAM para crear la malla
             if getattr(self, "manual_offload", False):
                 self.vae.to(self.device)
+
+            # ----- CPU-specific optimizations for mesh extraction -----
+            is_cpu = str(self.device) == 'cpu'
+            if is_cpu:
+                # Disable progress bar on CPU to prevent log spam
+                # (latents2mesh can generate 100k+ tqdm lines)
+                actual_enable_pbar = False
+                # Temporarily use ALL cores for mesh extraction
+                import time
+                original_threads = torch.get_num_threads()
+                torch.set_num_threads(total_cores)
+                logger.info(
+                    f"[CPU EXPORT] Starting mesh extraction: "
+                    f"octree={octree_resolution}, chunks={num_chunks}, "
+                    f"threads={torch.get_num_threads()}, mc_algo={mc_algo}. "
+                    f"This may take several minutes on CPU..."
+                )
+                start_time = time.time()
+            else:
+                actual_enable_pbar = enable_pbar
+                start_time = None
+            # ----------------------------------------------------------
 
             latents = 1. / self.vae.scale_factor * latents
             latents = self.vae(latents)
@@ -720,10 +570,19 @@ class Hunyuan3DDiTPipeline:
                 num_chunks=num_chunks,
                 octree_resolution=octree_resolution,
                 mc_algo=mc_algo,
-                enable_pbar=enable_pbar,
+                enable_pbar=actual_enable_pbar,
             )
 
-            # Offload logic: Bajamos el VAE y limpiamos
+            # ----- Restore settings and log completion -----
+            if is_cpu:
+                elapsed = time.time() - start_time
+                torch.set_num_threads(original_threads)
+                logger.info(
+                    f"[CPU EXPORT] Mesh extraction completed in {elapsed:.1f}s "
+                    f"({elapsed/60:.1f} min). Restored threads to {original_threads}."
+                )
+            # ------------------------------------------------
+
             if getattr(self, "manual_offload", False):
                 self.vae.to("cpu")
                 free_vram()
@@ -752,7 +611,7 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         octree_resolution=384,
         mc_level=0.0,
         mc_algo=None,
-        num_chunks=8000,
+        num_chunks=2000,
         output_type: Optional[str] = "trimesh",
         enable_pbar=True,
         **kwargs,
@@ -761,12 +620,10 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         callback_steps = kwargs.pop("callback_steps", None)
 
         self.set_surface_extractor(mc_algo)
-
         device = self.device
         dtype = self.dtype
         do_classifier_free_guidance = guidance_scale >= 0 and not (
-            hasattr(self.model, 'guidance_embed') and
-            self.model.guidance_embed is True
+            hasattr(self.model, 'guidance_embed') and self.model.guidance_embed is True
         )
 
         cond_inputs = self.prepare_image(image)
@@ -779,8 +636,6 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         )
         batch_size = image.shape[0]
 
-        # 5. Prepare timesteps
-        # NOTE: this is slightly different from common usage, we start from 0.
         sigmas = np.linspace(0, 1, num_inference_steps) if sigmas is None else sigmas
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
@@ -791,24 +646,19 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         latents = self.prepare_latents(batch_size, dtype, device, generator)
 
         guidance = None
-        if hasattr(self.model, 'guidance_embed') and \
-            self.model.guidance_embed is True:
+        if hasattr(self.model, 'guidance_embed') and self.model.guidance_embed is True:
             guidance = torch.tensor([guidance_scale] * batch_size, device=device, dtype=dtype)
-            # logger.info(f'Using guidance embed with scale {guidance_scale}')
 
-        # Offload logic: Preparamos la GPU para la generación DiT
         if getattr(self, "manual_offload", False):
             self.model.to(device)
 
         with synchronize_timer('Diffusion Sampling'):
             for i, t in enumerate(tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:")):
-                # expand the latents if we are doing classifier free guidance
                 if do_classifier_free_guidance:
                     latent_model_input = torch.cat([latents] * 2)
                 else:
                     latent_model_input = latents
 
-                # NOTE: we assume model get timesteps ranged from 0 to 1
                 timestep = t.expand(latent_model_input.shape[0]).to(
                     latents.dtype) / self.scheduler.config.num_train_timesteps
                 noise_pred = self.model(latent_model_input, timestep, cond, guidance=guidance)
@@ -817,7 +667,6 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
                     noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-                # compute the previous noisy sample x_t -> x_t-1
                 outputs = self.scheduler.step(noise_pred, t, latents)
                 latents = outputs.prev_sample
 
@@ -825,7 +674,6 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
                     step_idx = i // getattr(self.scheduler, "order", 1)
                     callback(step_idx, t, outputs)
 
-        # Offload logic: El DiT terminó, limpiamos
         if getattr(self, "manual_offload", False):
             self.model.to("cpu")
             free_vram()
