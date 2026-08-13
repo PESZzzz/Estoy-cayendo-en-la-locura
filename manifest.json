@@ -1,0 +1,108 @@
+{
+  "id": "hunyuan3d-2-1",
+  "name": "Hunyuan3D 2.1",
+  "type": "model",
+  "source": "https://github.com/PESZzzz/Estoy-cayendo-en-la-locura",
+  "description": "Hunyuan3D 2.1 community-optimised for AMD and low-VRAM systems. Generates high-quality 3D meshes from images. Texture node available as optional download.",
+  "version": "2.1.0",
+  "author": "Modly Community",
+  "generator_class": "Hunyuan3D21Generator",
+  "vram_gb": 6,
+  "tags": ["image-to-3d", "hunyuan3d", "3d", "amd-friendly", "low-vram"],
+  "nodes": [
+    {
+      "id": "generate",
+      "name": "Generate Mesh",
+      "input": "image",
+      "output": "mesh",
+      "hf_repo": "tencent/Hunyuan3D-2.1",
+      "download_check": "hunyuan3d-dit-v2-1/config.yaml",
+      "params_schema": [
+        {
+          "id": "num_inference_steps",
+          "label": "Quality",
+          "type": "select",
+          "default": 30,
+          "options": [
+            { "value": 15, "label": "Fast (15 steps)" },
+            { "value": 30, "label": "Balanced (30 steps)" },
+            { "value": 50, "label": "High Quality (50 steps)" }
+          ],
+          "tooltip": "Number of diffusion iterations. More = better quality, slower."
+        },
+        {
+          "id": "octree_resolution",
+          "label": "Mesh Resolution",
+          "type": "select",
+          "default": 256,
+          "options": [
+            { "value": 256, "label": "Low/Safe (256) — 4-6 GB VRAM" },
+            { "value": 384, "label": "Medium (384) — 8+ GB VRAM" },
+            { "value": 512, "label": "High (512) — 12+ GB VRAM" }
+          ],
+          "tooltip": "Octree resolution for mesh reconstruction. Lower = faster, less VRAM."
+        },
+        {
+          "id": "guidance_scale",
+          "label": "Guidance Scale",
+          "type": "float",
+          "default": 5.0,
+          "min": 1.0,
+          "max": 10.0,
+          "step": 0.5,
+          "tooltip": "Classifier-free guidance strength. Higher = closer to input image."
+        },
+        {
+          "id": "vertex_count",
+          "label": "Max Vertices",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 500000,
+          "step": 1000,
+          "tooltip": "Target vertex count for decimation. 0 = disabled."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 2147483647,
+          "tooltip": "Seed for reproducibility. -1 = random."
+        }
+      ]
+    },
+    {
+      "id": "texture",
+      "name": "Texture Mesh",
+      "input": "image",
+      "inputs": ["image", "mesh"],
+      "output": "mesh",
+      "hf_repo": "tencent/Hunyuan3D-2.1",
+      "download_check": "hunyuan3d-paintpbr-v2-1/model_index.json",
+      "params_schema": [
+        {
+          "id": "texture_resolution",
+          "label": "Texture Resolution",
+          "type": "select",
+          "default": 1024,
+          "options": [
+            { "value": 512, "label": "512" },
+            { "value": 1024, "label": "1024" }
+          ],
+          "tooltip": "Texture map resolution. Higher = sharper, more VRAM."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 2147483647,
+          "tooltip": "Seed for reproducibility. -1 = random."
+        }
+      ]
+    }
+  ]
+}
