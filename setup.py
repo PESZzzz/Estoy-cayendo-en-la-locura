@@ -5,17 +5,13 @@ Community-optimised setup script.  Handles:
   - Virtual-environment creation
   - PyTorch installation (CUDA / ROCm / CPU auto-detected)
   - Python dependency installation
-  - Download of hy3dshape/ source code from HuggingFace Space
   - Optional native extensions (diso on Linux, skipped on Windows)
   - Extension path linking so Modly can import local modules
 
 NOTES:
   - Model weights are handled BY MODLY via manifest.json nodes.
-    This script only downloads the Python source code (hy3dshape/)
-    from the official HuggingFace Space, because the model repo
-    (tencent/Hunyuan3D-2.1) does NOT include the hy3dshape folder.
-  - hy3dpaint/ is included in the model repo, so Modly downloads it
-    automatically when the user chooses the "Texture Mesh" node.
+    This script only installs Python dependencies and links the code.
+  - The hy3dshape/ source code is bundled with this extension.
 """
 
 import json
@@ -23,7 +19,6 @@ import os
 import platform
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
 
@@ -32,10 +27,6 @@ from pathlib import Path
 # ------------------------------------------------------------------ #
 EXTENSION_NAME = "hunyuan3d-2-1"
 EXTENSION_DIR = Path(__file__).parent.resolve()
-
-# HuggingFace Space that contains the hy3dshape source code
-HF_SPACE_REPO = "spaces/tencent/Hunyuan3D-2.1"
-HY3DSHAPE_PREFIX = "hy3dshape/"
 
 # Core Python packages required by Hunyuan3D 2.1
 PACKAGES_CORE = [
@@ -62,11 +53,6 @@ PACKAGES_CORE = [
 # Platform shortcuts
 _IS_WINDOWS = platform.system() == "Windows"
 _IS_LINUX   = platform.system() == "Linux"
-
-# File extensions we download from the Space (code + configs)
-CODE_EXTS = {".py", ".yaml", ".yml", ".json", ".md", ".txt", ".sh", ".cfg", ".ini"}
-# File extensions we skip (weights)
-WEIGHT_EXTS = {".safetensors", ".ckpt", ".bin", ".pth", ".pt", ".onnx", ".gguf"}
 
 
 def log(msg: str) -> None:
@@ -112,6 +98,11 @@ def _create_venv(python_exe: str, ext_dir: Path) -> Path:
 def _install_torch(venv: Path, torch_flavor: str) -> None:
     """
     Install PyTorch with the correct index URL for the detected accelerator.
+
+    torch_flavor values from Modly:
+      "cuda"  -> NVIDIA CUDA (default)
+      "rocm"  -> AMD ROCm (Linux only)
+      "cpu"   -> CPU-only fallback
     """
     log(f"Installing PyTorch (flavor={torch_flavor}) ...")
 
@@ -145,10 +136,18 @@ def _install_core_deps(venv: Path) -> None:
 
 
 def _install_optional_native(venv: Path) -> None:
-    """Install optional native extensions (diso)."""
+    """
+    Install optional native extensions.
+
+    diso  -> Fast Dual Marching Cubes.  Requires a C++ compiler.
+           Skipped on Windows (MSVC not guaranteed in PATH).
+           Attempted on Linux where GCC is usually present.
+    """
     if _IS_WINDOWS:
         log("Skipping 'diso' on Windows (requires MSVC, not guaranteed).")
         log("The pipeline will use standard marching cubes (mc_algo='mc').")
+        log("If you want DMC later, install Visual Studio Build Tools")
+        log("and run: pip install diso --no-build-isolation")
         return
 
     log("Attempting to install 'diso' for faster mesh extraction ...")
@@ -159,74 +158,10 @@ def _install_optional_native(venv: Path) -> None:
         log(f"diso installation failed ({e}). Falling back to mc_algo='mc'.")
 
 
-def _download_hy3dshape_from_space(ext_dir: Path) -> None:
-    """
-    Download the hy3dshape/ source folder from the official HuggingFace Space.
-
-    The model repo (tencent/Hunyuan3D-2.1) does NOT include hy3dshape/.
-    It only lives inside the Space (spaces/tencent/Hunyuan3D-2.1).
-    We fetch only code/config files, skipping any model weights.
-    """
-    log("Downloading hy3dshape/ source code from HuggingFace Space ...")
-    log(f"Space: {HF_SPACE_REPO}")
-
-    api_url = f"https://huggingface.co/api/spaces/tencent/Hunyuan3D-2.1/tree/main?recursive=true"
-    base_url = f"https://huggingface.co/{HF_SPACE_REPO}/resolve/main/"
-
-    try:
-        req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        log(f"WARNING: Could not list files from Space API ({e}).")
-        log("The extension may not work without hy3dshape/.")
-        log("Please download it manually from:")
-        log("  https://huggingface.co/spaces/tencent/Hunyuan3D-2.1/tree/main/hy3dshape")
-        return
-
-    downloaded = 0
-    skipped = 0
-
-    for entry in data:
-        path = entry.get("path", "")
-        etype = entry.get("type", "")
-        size = entry.get("size", 0)
-
-        if etype == "directory":
-            continue
-
-        # Only files inside hy3dshape/
-        if not path.startswith(HY3DSHAPE_PREFIX):
-            skipped += 1
-            continue
-
-        ext = os.path.splitext(path)[1].lower()
-
-        if ext in WEIGHT_EXTS:
-            skipped += 1
-            continue
-
-        # Target path inside the extension directory
-        relative = path[len(HY3DSHAPE_PREFIX):]  # strip "hy3dshape/"
-        local_path = ext_dir / relative
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-
-        url = base_url + path
-        try:
-            urllib.request.urlretrieve(url, str(local_path))
-            downloaded += 1
-            log(f"  + {relative}")
-        except Exception as e:
-            log(f"  ! FAILED {relative}: {e}")
-
-    log(f"hy3dshape/ download complete: {downloaded} files downloaded, {skipped} skipped.")
-
-
-def _link_extension_to_venv(venv: Path, ext_dir: Path) -> None:
+def _link_extension_to_venv(venv: Path) -> None:
     """
     Create a .pth file so Python inside the venv can import the
-    extension modules (pipelines.py, volume_decoders.py, hy3dshape/, etc.)
-    directly without a pip install.
+    extension modules (hy3dshape/, generator.py, etc.) directly.
     """
     log("Linking extension directory to Python environment ...")
 
@@ -241,7 +176,7 @@ def _link_extension_to_venv(venv: Path, ext_dir: Path) -> None:
 
     site_packages.mkdir(parents=True, exist_ok=True)
     pth_file = site_packages / f"{EXTENSION_NAME}.pth"
-    pth_file.write_text(str(ext_dir), encoding="utf-8")
+    pth_file.write_text(str(EXTENSION_DIR), encoding="utf-8")
     log(f".pth link created: {pth_file}")
 
 
@@ -256,6 +191,13 @@ def setup(
 ) -> None:
     """
     Main entry point called by Modly during extension installation.
+
+    Parameters:
+      python_exe   : Path to the system Python that will create the venv.
+      ext_dir      : Extension directory (where this setup.py lives).
+      torch_flavor : "cuda" | "rocm" | "cpu" — detected by Modly.
+      accelerator  : Additional accelerator info (unused, reserved).
+      platform_name: OS platform string (unused, reserved).
     """
     log(f"=== {EXTENSION_NAME} setup starting ===")
     log(f"Extension directory: {ext_dir}")
@@ -273,18 +215,16 @@ def setup(
     # 4. Optional native extensions
     _install_optional_native(venv)
 
-    # 5. Download hy3dshape/ source code from HF Space
-    #    (The model repo does not include it — it only lives in the Space)
-    _download_hy3dshape_from_space(ext_dir)
-
-    # 6. Link extension code into the venv so imports work
-    _link_extension_to_venv(venv, ext_dir)
+    # 5. Link extension code into the venv so imports work
+    _link_extension_to_venv(venv)
 
     # ------------------------------------------------------------------ #
-    # IMPORTANT: Model weights are NOT downloaded here.                  #
-    # Modly handles them per-node via manifest.json:                     #
-    #   - "Generate Mesh" node -> downloads hunyuan3d-dit-v2-1           #
-    #   - "Texture Mesh" node  -> downloads hunyuan3d-paintpbr-v2-1      #
+    # IMPORTANT: We do NOT download model weights here.                  #
+    # ------------------------------------------------------------------ #
+    # Modly handles model downloads per-node via manifest.json:
+    #   - "Generate Mesh" node -> downloads hunyuan3d-dit-v2-1
+    #   - "Texture Mesh" node  -> downloads hunyuan3d-paintpbr-v2-1
+    # The user decides which nodes to download from the Models page.
     # ------------------------------------------------------------------ #
 
     log("=== Setup complete ===")
@@ -293,10 +233,12 @@ def setup(
 
 
 if __name__ == "__main__":
+    # Modly calls setup.py with a JSON string as the first argument
     if len(sys.argv) >= 2:
         try:
             args = json.loads(sys.argv[1])
         except json.JSONDecodeError:
+            # Fallback for older Modly versions that pass positional args
             args = {
                 "python_exe": sys.argv[1],
                 "ext_dir": sys.argv[2] if len(sys.argv) > 2 else str(Path(__file__).parent),
