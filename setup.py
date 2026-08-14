@@ -32,7 +32,7 @@ EXTENSION_DIR = Path(__file__).parent.resolve()
 BATCHES = [
     {"packages": ["--upgrade", "pip"], "timeout": 120, "label": "Upgrading pip"},
     {"packages": ["numpy", "scipy", "scikit-image"], "timeout": 600, "label": "Installing scientific stack"},
-    {"packages": ["diffusers>=0.32.0", "transformers>=4.46.0", "accelerate>=0.17.0", "safetensors", "einops", "omegaconf"], "timeout": 600, "label": "Installing ML stack"},
+    {"packages": ["diffusers>=0.32.0", "transformers>=4.46.0", "accelerate>=0.17.0", "safetensors", "einops", "omegaconf", "timm"], "timeout": 600, "label": "Installing ML stack"},
     {"packages": ["trimesh", "pymeshlab", "mcubes", "opencv-python-headless", "Pillow", "rembg"], "timeout": 600, "label": "Installing 3D / image stack"},
     {"packages": ["huggingface_hub", "tqdm", "pyyaml", "psutil"], "timeout": 300, "label": "Installing utilities"},
 ]
