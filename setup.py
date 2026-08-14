@@ -4,7 +4,7 @@ Hunyuan3D 2.1 Extension Setup for Modly
 Community-optimised setup script.  Handles:
   - Virtual-environment creation
   - PyTorch installation (CUDA / ROCm / CPU auto-detected)
-  - Python dependency installation
+  - Python dependency installation (in small batches to avoid timeouts)
   - Optional native extensions (diso on Linux, skipped on Windows)
   - Extension path linking so Modly can import local modules
 
@@ -28,26 +28,19 @@ from pathlib import Path
 EXTENSION_NAME = "hunyuan3d-2-1"
 EXTENSION_DIR = Path(__file__).parent.resolve()
 
-# Core Python packages required by Hunyuan3D 2.1
-PACKAGES_CORE = [
-    "Pillow",
-    "numpy",
-    "trimesh",
-    "pymeshlab",
-    "opencv-python-headless",
-    "huggingface_hub",
-    "safetensors",
-    "diffusers>=0.32.0",
-    "transformers>=4.46.0",
-    "accelerate>=0.17.0",
-    "einops",
-    "scipy",
-    "scikit-image",
-    "rembg",
-    "mcubes",
-    "tqdm",
-    "pyyaml",
-    "psutil",
+# Dependencies split into batches to avoid Windows/embedded-Python timeouts.
+# Heavy packages (with native compilation) get their own batch + longer timeout.
+BATCHES = [
+    # Batch 1: upgrade pip first (fast)
+    {"packages": ["--upgrade", "pip"], "timeout": 120, "label": "Upgrading pip"},
+    # Batch 2: heavy scientific stack (slow on Windows, may compile)
+    {"packages": ["numpy", "scipy", "scikit-image"], "timeout": 600, "label": "Installing scientific stack"},
+    # Batch 3: ML / diffusion stack
+    {"packages": ["diffusers>=0.32.0", "transformers>=4.46.0", "accelerate>=0.17.0", "safetensors", "einops"], "timeout": 600, "label": "Installing ML stack"},
+    # Batch 4: 3D / image processing
+    {"packages": ["trimesh", "pymeshlab", "mcubes", "opencv-python-headless", "Pillow", "rembg"], "timeout": 600, "label": "Installing 3D / image stack"},
+    # Batch 5: utilities
+    {"packages": ["huggingface_hub", "tqdm", "pyyaml", "psutil"], "timeout": 300, "label": "Installing utilities"},
 ]
 
 # Platform shortcuts
@@ -76,10 +69,10 @@ def _python_in_venv(venv: Path) -> Path:
     return venv / ("Scripts/python.exe" if _IS_WINDOWS else "bin/python")
 
 
-def _pip(venv: Path, *args: str) -> None:
-    """Run pip inside the venv.  Raises on failure."""
+def _pip(venv: Path, args: list, timeout: int = 300) -> None:
+    """Run pip inside the venv with a custom timeout.  Raises on failure."""
     py = _python_in_venv(venv)
-    _run([str(py), "-m", "pip", *args])
+    _run([str(py), "-m", "pip", "install", *args], timeout=timeout)
 
 
 def _create_venv(python_exe: str, ext_dir: Path) -> Path:
@@ -98,11 +91,6 @@ def _create_venv(python_exe: str, ext_dir: Path) -> Path:
 def _install_torch(venv: Path, torch_flavor: str) -> None:
     """
     Install PyTorch with the correct index URL for the detected accelerator.
-
-    torch_flavor values from Modly:
-      "cuda"  -> NVIDIA CUDA (default)
-      "rocm"  -> AMD ROCm (Linux only)
-      "cpu"   -> CPU-only fallback
     """
     log(f"Installing PyTorch (flavor={torch_flavor}) ...")
 
@@ -111,48 +99,51 @@ def _install_torch(venv: Path, torch_flavor: str) -> None:
             log("WARNING: ROCm is not supported on Windows. Falling back to CPU.")
             torch_flavor = "cpu"
         else:
-            _pip(venv, "install", "torch", "torchvision",
-                 "--index-url", "https://download.pytorch.org/whl/rocm7.2")
+            _pip(venv, ["torch", "torchvision", "--index-url", "https://download.pytorch.org/whl/rocm7.2"], timeout=600)
             log("PyTorch + ROCm 7.2 installed.")
             return
 
     if torch_flavor == "cpu":
-        _pip(venv, "install", "torch", "torchvision",
-             "--index-url", "https://download.pytorch.org/whl/cpu")
+        _pip(venv, ["torch", "torchvision", "--index-url", "https://download.pytorch.org/whl/cpu"], timeout=600)
         log("PyTorch (CPU-only) installed.")
         return
 
     # Default: CUDA
-    _pip(venv, "install", "torch", "torchvision")
+    _pip(venv, ["torch", "torchvision"], timeout=600)
     log("PyTorch (CUDA) installed.")
 
 
 def _install_core_deps(venv: Path) -> None:
-    """Install the pure-Python dependencies required by the pipeline."""
-    log("Installing core Python dependencies ...")
-    _pip(venv, "install", "--upgrade", "pip")
-    _pip(venv, "install", *PACKAGES_CORE)
-    log("Core dependencies installed.")
+    """Install dependencies in small batches to avoid Windows timeouts."""
+    log("Installing core Python dependencies (in batches to avoid timeouts)...")
+
+    for batch in BATCHES:
+        label = batch["label"]
+        packages = batch["packages"]
+        timeout = batch["timeout"]
+
+        log(f"  -> {label}: {', '.join(packages)}")
+        try:
+            _pip(venv, packages, timeout=timeout)
+            log(f"     {label} OK")
+        except subprocess.TimeoutExpired:
+            log(f"     TIMEOUT after {timeout}s. Retrying once with doubled timeout...")
+            _pip(venv, packages, timeout=timeout * 2)
+            log(f"     {label} OK (retry)")
+
+    log("All core dependencies installed.")
 
 
 def _install_optional_native(venv: Path) -> None:
-    """
-    Install optional native extensions.
-
-    diso  -> Fast Dual Marching Cubes.  Requires a C++ compiler.
-           Skipped on Windows (MSVC not guaranteed in PATH).
-           Attempted on Linux where GCC is usually present.
-    """
+    """Install optional native extensions (diso)."""
     if _IS_WINDOWS:
         log("Skipping 'diso' on Windows (requires MSVC, not guaranteed).")
         log("The pipeline will use standard marching cubes (mc_algo='mc').")
-        log("If you want DMC later, install Visual Studio Build Tools")
-        log("and run: pip install diso --no-build-isolation")
         return
 
     log("Attempting to install 'diso' for faster mesh extraction ...")
     try:
-        _pip(venv, "install", "diso")
+        _pip(venv, ["diso"], timeout=600)
         log("diso installed! You can use mc_algo='dmc' for faster extraction.")
     except Exception as e:
         log(f"diso installation failed ({e}). Falling back to mc_algo='mc'.")
@@ -191,13 +182,6 @@ def setup(
 ) -> None:
     """
     Main entry point called by Modly during extension installation.
-
-    Parameters:
-      python_exe   : Path to the system Python that will create the venv.
-      ext_dir      : Extension directory (where this setup.py lives).
-      torch_flavor : "cuda" | "rocm" | "cpu" — detected by Modly.
-      accelerator  : Additional accelerator info (unused, reserved).
-      platform_name: OS platform string (unused, reserved).
     """
     log(f"=== {EXTENSION_NAME} setup starting ===")
     log(f"Extension directory: {ext_dir}")
@@ -209,7 +193,7 @@ def setup(
     # 2. Install PyTorch with the correct backend
     _install_torch(venv, torch_flavor)
 
-    # 3. Install core Python dependencies
+    # 3. Install core Python dependencies (in batches)
     _install_core_deps(venv)
 
     # 4. Optional native extensions
@@ -220,11 +204,7 @@ def setup(
 
     # ------------------------------------------------------------------ #
     # IMPORTANT: We do NOT download model weights here.                  #
-    # ------------------------------------------------------------------ #
-    # Modly handles model downloads per-node via manifest.json:
-    #   - "Generate Mesh" node -> downloads hunyuan3d-dit-v2-1
-    #   - "Texture Mesh" node  -> downloads hunyuan3d-paintpbr-v2-1
-    # The user decides which nodes to download from the Models page.
+    # Modly handles them per-node via manifest.json.                     #
     # ------------------------------------------------------------------ #
 
     log("=== Setup complete ===")
@@ -233,12 +213,10 @@ def setup(
 
 
 if __name__ == "__main__":
-    # Modly calls setup.py with a JSON string as the first argument
     if len(sys.argv) >= 2:
         try:
             args = json.loads(sys.argv[1])
         except json.JSONDecodeError:
-            # Fallback for older Modly versions that pass positional args
             args = {
                 "python_exe": sys.argv[1],
                 "ext_dir": sys.argv[2] if len(sys.argv) > 2 else str(Path(__file__).parent),
