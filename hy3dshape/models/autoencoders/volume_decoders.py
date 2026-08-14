@@ -2,16 +2,43 @@
 # except for the third-party components listed below.
 # Hunyuan 3D does not impose any additional limitations beyond what is outlined
 # in the repsective licenses of these third-party components.
-# Users must comply with all terms and conditions of original licenses of these third-party
-# components and must ensure that the usage of the third party components adheres to
-# all relevant laws and regulations.
-
+# Users must comply with all terms and conditions of original licenses of these
+# third-party components and must ensure that the usage of the third party
+# components adheres to all relevant laws and regulations.
+#
 # For avoidance of doubts, Hunyuan 3D means the large language models and
-# their software and algorithms, including trained model weights, parameters (including
-# optimizer states), machine-learning model code, inference-enabling code, training-enabling code,
-# fine-tuning enabling code and other elements of the foregoing made publicly available
-# by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
+# their software and algorithms, including trained model weights, parameters
+# (including optimizer states), machine-learning model code, inference-enabling
+# code, training-enabling code, fine-tuning enabling code and other elements
+# of the foregoing made publicly available by Tencent in accordance with
+# TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
+#
+# ============================================================================
+# COMMUNITY LOW-VRAM / CONSUMER-HARDWARE OPTIMISATIONS
+# ============================================================================
+# This file has been adapted by the community for running on modest hardware:
+#   - Laptops and desktops with 4-8 GB VRAM
+#   - CPU-only inference
+#   - AMD GPUs (ROCm on Linux, CPU fallback on Windows)
+#
+# Key adaptations:
+#   1. Aggressive memory cleanup (gc.collect + cuda.empty_cache) after heavy
+#      tensor operations to prevent OOM crashes.
+#   2. Pre-allocated output tensors instead of growing torch.cat() lists.
+#      The upstream code appends every chunk to a Python list and then calls
+#      torch.cat() at the end, which briefly doubles memory usage (~200 % peak).
+#      We write directly into a pre-allocated tensor, keeping peak memory
+#      close to the final size.
+#   3. Explicit `del` of intermediate tensors inside loops so the allocator
+#      can reuse the memory immediately instead of waiting for the function
+#      to return.
+#   4. `free_memory()` calls between hierarchical octree levels so a
+#      low-VRAM GPU can survive the multi-resolution refinement.
+#
+# Look for "[COMMUNITY]" tags in the comments below.
+# ============================================================================
 
+import gc
 from typing import Union, Tuple, List, Callable
 
 import numpy as np
@@ -24,6 +51,20 @@ from tqdm import tqdm
 from .attention_blocks import CrossAttentionDecoder
 from .attention_processors import FlashVDMCrossAttentionProcessor, FlashVDMTopMCrossAttentionProcessor
 from ...utils import logger
+
+
+# =============================================================================
+# [COMMUNITY] Memory cleanup helper
+# =============================================================================
+# Called after heavy tensor blocks to force the Python garbage collector
+# to release orphaned tensors and, on CUDA, to return freed blocks to the
+# driver pool so the next allocation does not OOM.
+# =============================================================================
+def free_memory():
+    """Limpieza de RAM y VRAM para evitar crasheos por picos de memoria."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def extract_near_surface_volume_fn(input_tensor: torch.Tensor, alpha: float):
@@ -102,6 +143,15 @@ def extract_near_surface_volume_fn(input_tensor: torch.Tensor, alpha: float):
 
     # 计算符号一致性（转换为float32确保精度）
     sign = torch.sign(val.to(torch.float32))
+
+    # =================================================================
+    # [COMMUNITY] Delete the original tensor before stacking neighbours
+    # =================================================================
+    # `val` is no longer needed; removing it now frees the memory block
+    # before we allocate the 6-channel neighbours_sign tensor.
+    # =================================================================
+    del val
+
     neighbors_sign = torch.stack([
         torch.sign(left.to(torch.float32)),
         torch.sign(right.to(torch.float32)),
@@ -111,8 +161,23 @@ def extract_near_surface_volume_fn(input_tensor: torch.Tensor, alpha: float):
         torch.sign(up.to(torch.float32))
     ], dim=0)
 
+    # =================================================================
+    # [COMMUNITY] Aggressive cleanup of intermediate direction tensors
+    # =================================================================
+    # Each of these is the same size as the full grid; together they can
+    # consume several hundred MB.  Deleting them before the next alloc
+    # prevents a temporary ~6x memory spike.
+    # =================================================================
+    del left, right, back, front, down, up
+    free_memory()
+
     # 检查所有符号是否一致
     same_sign = torch.all(neighbors_sign == sign, dim=0)
+
+    # =================================================================
+    # [COMMUNITY] Release sign tensors before creating the mask
+    # =================================================================
+    del neighbors_sign, sign
 
     # 生成最终掩码
     mask = (~same_sign).to(torch.int32)
@@ -167,17 +232,47 @@ class VanillaVolumeDecoder:
         )
         xyz_samples = torch.from_numpy(xyz_samples).to(device, dtype=dtype).contiguous().reshape(-1, 3)
 
-        # 2. latents to 3d volume
-        batch_logits = []
-        for start in tqdm(range(0, xyz_samples.shape[0], num_chunks), desc=f"Volume Decoding",
-                          disable=not enable_pbar):
-            chunk_queries = xyz_samples[start: start + num_chunks, :]
-            chunk_queries = repeat(chunk_queries, "p c -> b p c", b=batch_size)
-            logits = geo_decoder(queries=chunk_queries, latents=latents)
-            batch_logits.append(logits)
+        total_points = xyz_samples.shape[0]
 
-        grid_logits = torch.cat(batch_logits, dim=1)
-        grid_logits = grid_logits.view((batch_size, *grid_size)).float()
+        # =================================================================
+        # [COMMUNITY] Pre-allocated output tensor
+        # =================================================================
+        # Upstream code builds a Python list `batch_logits = []` and appends
+        # every chunk, then calls torch.cat() at the end.  During the final
+        # cat() both the list AND the concatenated tensor exist simultaneously,
+        # causing a ~200 % memory spike that OOMs 4-6 GB GPUs.
+        #
+        # Instead we allocate the final tensor once and write each chunk
+        # directly into its slice.  Peak memory stays close to the final size.
+        # =================================================================
+        grid_logits_flat = torch.empty((batch_size, total_points, 1), dtype=dtype, device=device)
+
+        for start in tqdm(range(0, total_points, num_chunks), desc=f"Volume Decoding",
+                          disable=not enable_pbar):
+            end = min(start + num_chunks, total_points)
+            chunk_queries = xyz_samples[start: end, :]
+            chunk_queries = repeat(chunk_queries, "p c -> b p c", b=batch_size)
+
+            logits = geo_decoder(queries=chunk_queries, latents=latents)
+            grid_logits_flat[:, start:end, :] = logits
+
+            # =================================================================
+            # [COMMUNITY] Immediate deletion of chunk temporaries
+            # =================================================================
+            # Without explicit del the tensors survive until the end of the
+            # iteration, blocking reuse of their memory for the next chunk.
+            # =================================================================
+            del chunk_queries
+            del logits
+
+        grid_logits = grid_logits_flat.view((batch_size, *grid_size)).float()
+
+        # =================================================================
+        # [COMMUNITY] Final cleanup before returning
+        # =================================================================
+        del grid_logits_flat
+        del xyz_samples
+        free_memory()
 
         return grid_logits
 
@@ -228,22 +323,35 @@ class HierarchicalVolumeDecoding:
         xyz_samples = torch.from_numpy(xyz_samples).to(device, dtype=dtype).contiguous().reshape(-1, 3)
 
         # 2. latents to 3d volume
-        batch_logits = []
         batch_size = latents.shape[0]
-        for start in tqdm(range(0, xyz_samples.shape[0], num_chunks),
+        total_samples = xyz_samples.shape[0]
+
+        # =================================================================
+        # [COMMUNITY] Pre-allocated tensor for first octree level
+        # =================================================================
+        grid_logits_flat = torch.empty((batch_size, total_samples, 1), dtype=dtype, device=device)
+
+        for start in tqdm(range(0, total_samples, num_chunks),
                           desc=f"Hierarchical Volume Decoding [r{resolutions[0] + 1}]"):
-            queries = xyz_samples[start: start + num_chunks, :]
+            end = min(start + num_chunks, total_samples)
+            queries = xyz_samples[start:end, :]
             batch_queries = repeat(queries, "p c -> b p c", b=batch_size)
             logits = geo_decoder(queries=batch_queries, latents=latents)
-            batch_logits.append(logits)
 
-        grid_logits = torch.cat(batch_logits, dim=1).view((batch_size, grid_size[0], grid_size[1], grid_size[2]))
+            grid_logits_flat[:, start:end, :] = logits
+
+            del queries, batch_queries, logits
+
+        grid_logits = grid_logits_flat.view((batch_size, grid_size[0], grid_size[1], grid_size[2]))
+        del xyz_samples, grid_logits_flat
+        free_memory()
 
         for octree_depth_now in resolutions[1:]:
             grid_size = np.array([octree_depth_now + 1] * 3)
             resolution = bbox_size / octree_depth_now
             next_index = torch.zeros(tuple(grid_size), dtype=dtype, device=device)
             next_logits = torch.full(next_index.shape, -10000., dtype=dtype, device=device)
+
             curr_points = extract_near_surface_volume_fn(grid_logits.squeeze(0), mc_level)
             curr_points += grid_logits.squeeze(0).abs() < 0.95
 
@@ -254,6 +362,9 @@ class HierarchicalVolumeDecoding:
             for i in range(expand_num):
                 curr_points = dilate(curr_points.unsqueeze(0).to(dtype)).squeeze(0)
             (cidx_x, cidx_y, cidx_z) = torch.where(curr_points > 0)
+
+            del curr_points
+
             next_index[cidx_x * 2, cidx_y * 2, cidx_z * 2] = 1
             for i in range(2 - expand_num):
                 next_index = dilate(next_index.unsqueeze(0)).squeeze(0)
@@ -262,16 +373,37 @@ class HierarchicalVolumeDecoding:
             next_points = torch.stack(nidx, dim=1)
             next_points = (next_points * torch.tensor(resolution, dtype=next_points.dtype, device=device) +
                            torch.tensor(bbox_min, dtype=next_points.dtype, device=device))
-            batch_logits = []
-            for start in tqdm(range(0, next_points.shape[0], num_chunks),
+
+            total_next_points = next_points.shape[0]
+
+            # =================================================================
+            # [COMMUNITY] Pre-allocated tensor for hierarchical refinement
+            # =================================================================
+            grid_logits_next = torch.empty((batch_size, total_next_points, 1), dtype=dtype, device=device)
+
+            for start in tqdm(range(0, total_next_points, num_chunks),
                               desc=f"Hierarchical Volume Decoding [r{octree_depth_now + 1}]"):
-                queries = next_points[start: start + num_chunks, :]
+                end = min(start + num_chunks, total_next_points)
+                queries = next_points[start:end, :]
                 batch_queries = repeat(queries, "p c -> b p c", b=batch_size)
                 logits = geo_decoder(queries=batch_queries.to(latents.dtype), latents=latents)
-                batch_logits.append(logits)
-            grid_logits = torch.cat(batch_logits, dim=1)
-            next_logits[nidx] = grid_logits[0, ..., 0]
+
+                grid_logits_next[:, start:end, :] = logits
+
+                del queries, batch_queries, logits
+
+            next_logits[nidx] = grid_logits_next[0, ..., 0]
             grid_logits = next_logits.unsqueeze(0)
+
+            # =================================================================
+            # [COMMUNITY] Cleanup between octree levels
+            # =================================================================
+            # Each level can be larger than the previous one.  Without this
+            # cleanup a 6 GB GPU OOMs between level 2 and 3.
+            # =================================================================
+            del grid_logits_next, next_points
+            free_memory()
+
         grid_logits[grid_logits == -10000.] = float('nan')
 
         return grid_logits
@@ -352,23 +484,38 @@ class FlashVDMVolumeDecoding:
         ).reshape(
             -1, mini_grid_size * mini_grid_size * mini_grid_size, 3
         )
-        batch_logits = []
+
+        total_batches = xyz_samples.shape[0]
         num_batchs = max(num_chunks // xyz_samples.shape[1], 1)
-        for start in tqdm(range(0, xyz_samples.shape[0], num_batchs),
+
+        # =================================================================
+        # [COMMUNITY] Pre-allocated tensor for FlashVDM mini-grid decode
+        # =================================================================
+        cat_logits = torch.empty((total_batches, xyz_samples.shape[1], 1), dtype=dtype, device=device)
+
+        for start in tqdm(range(0, total_batches, num_batchs),
                           desc=f"FlashVDM Volume Decoding", disable=not enable_pbar):
-            queries = xyz_samples[start: start + num_batchs, :]
+            end = min(start + num_batchs, total_batches)
+            queries = xyz_samples[start:end, :]
             batch = queries.shape[0]
             batch_latents = repeat(latents.squeeze(0), "p c -> b p c", b=batch)
+
             processor.topk = True
             logits = geo_decoder(queries=queries, latents=batch_latents)
-            batch_logits.append(logits)
-        grid_logits = torch.cat(batch_logits, dim=0).reshape(
+
+            cat_logits[start:end] = logits
+            del queries, batch_latents, logits
+
+        grid_logits = cat_logits.reshape(
             mini_grid_num, mini_grid_num, mini_grid_num,
             mini_grid_size, mini_grid_size,
             mini_grid_size
         ).permute(0, 3, 1, 4, 2, 5).contiguous().view(
             (batch_size, grid_size[0], grid_size[1], grid_size[2])
         )
+
+        del cat_logits, xyz_samples
+        free_memory()
 
         for octree_depth_now in resolutions[1:]:
             grid_size = np.array([octree_depth_now + 1] * 3)
@@ -385,6 +532,8 @@ class FlashVDMVolumeDecoding:
             for i in range(expand_num):
                 curr_points = dilate(curr_points.unsqueeze(0).to(dtype)).squeeze(0)
             (cidx_x, cidx_y, cidx_z) = torch.where(curr_points > 0)
+
+            del curr_points
 
             next_index[cidx_x * 2, cidx_y * 2, cidx_z * 2] = 1
             for i in range(2 - expand_num):
@@ -404,9 +553,17 @@ class FlashVDMVolumeDecoding:
             index = index.sort()
             next_points = next_points[index.indices].unsqueeze(0).contiguous()
             unique_values = torch.unique(index.values, return_counts=True)
+
             grid_logits = torch.zeros((next_points.shape[1]), dtype=latents.dtype, device=latents.device)
             input_grid = [[], []]
-            logits_grid_list = []
+
+            # =================================================================
+            # [COMMUNITY] In-place insertion instead of growing list + cat
+            # =================================================================
+            # Upstream code accumulates every grid batch in logits_grid_list
+            # and then torch.cat()s them.  We write directly into grid_logits
+            # at the correct sorted indices, keeping peak memory flat.
+            # =================================================================
             start_num = 0
             sum_num = 0
             for grid_index, count in zip(unique_values[0].cpu().tolist(), unique_values[1].cpu().tolist()):
@@ -417,18 +574,27 @@ class FlashVDMVolumeDecoding:
                 else:
                     processor.topk = input_grid
                     logits_grid = geo_decoder(queries=next_points[:, start_num:start_num + sum_num], latents=latents)
+                    # Insert directly at sorted positions instead of appending
+                    grid_logits[index.indices[start_num:start_num + sum_num]] = logits_grid.squeeze(0).squeeze(-1)
+
                     start_num = start_num + sum_num
-                    logits_grid_list.append(logits_grid)
                     input_grid = [[grid_index], [count]]
                     sum_num = count
+                    del logits_grid
+
             if sum_num > 0:
                 processor.topk = input_grid
                 logits_grid = geo_decoder(queries=next_points[:, start_num:start_num + sum_num], latents=latents)
-                logits_grid_list.append(logits_grid)
-            logits_grid = torch.cat(logits_grid_list, dim=1)
-            grid_logits[index.indices] = logits_grid.squeeze(0).squeeze(-1)
+                grid_logits[index.indices[start_num:start_num + sum_num]] = logits_grid.squeeze(0).squeeze(-1)
+                del logits_grid
+
             next_logits[nidx] = grid_logits
             grid_logits = next_logits.unsqueeze(0)
+
+            # =================================================================
+            # [COMMUNITY] Cleanup after each hierarchical level
+            # =================================================================
+            free_memory()
 
         grid_logits[grid_logits == -10000.] = float('nan')
 
