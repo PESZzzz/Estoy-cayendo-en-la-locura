@@ -20,6 +20,7 @@
 #   - AMD GPUs (ROCm on Linux, CPU fallback on Windows)
 #   - Laptops and desktops with limited VRAM (4-8 GB)
 #   - CPU-only inference when no GPU is available
+#   - HYBRID mode: uses GPU for diffusion + CPU for mesh extraction
 #
 # Key adaptations:
 #   1. Thread limiting to prevent system freezes on consumer CPUs
@@ -30,6 +31,9 @@
 #   5. Import path fallbacks so the pipeline works regardless of how the
 #      package was installed (hy3dshape, hy3dgen, _hy3dgen, etc.)
 #   6. VRAM cleanup helpers to survive on GPUs with < 8 GB
+#   7. SMART DEVICE MANAGER: auto-detects hardware and picks the best
+#      strategy (GPU-only, Hybrid, or CPU-only) to avoid crashes
+#   8. RAM spike prevention: removed hidden memory bombs (deepcopy, etc.)
 #
 # If you are a developer extending this, look for the "[COMMUNITY]" tags
 # in the comments below.
@@ -56,6 +60,155 @@ from tqdm import tqdm
 from .models.autoencoders import ShapeVAE
 from .models.autoencoders import SurfaceExtractors
 from .utils import logger, synchronize_timer, smart_load_model
+
+
+# =============================================================================
+# [COMMUNITY] Smart Device Manager
+# =============================================================================
+# This class looks at your computer and decides the BEST way to run the
+# pipeline without crashing.  It answers three questions:
+#
+#   1. Do you have a GPU?  (NVIDIA CUDA, AMD ROCm, or Apple MPS)
+#   2. How much VRAM does it have?
+#   3. Should we run everything on GPU, split the work (GPU + CPU), or
+#      fall back to CPU-only?
+#
+# Strategies
+# ----------
+#   "gpu"    -> Diffusion + VAE + mesh extraction all on the GPU.
+#               Used when you have a dedicated card with 8 GB+ VRAM.
+#
+#   "hybrid" -> Diffusion runs on the GPU (fast), but the heavy mesh
+#               extraction runs on the CPU (saves VRAM).
+#               Used for low-VRAM cards (4-8 GB), AMD integrated graphics,
+#               or laptops where the GPU shares RAM with the system.
+#
+#   "cpu"    -> Everything runs on the CPU.
+#               Used when there is no GPU, or the GPU is too weak.
+#
+# Why this matters for AMD users on Windows
+# -----------------------------------------
+# Official PyTorch does NOT support ROCm on Windows.  That means most AMD
+# GPUs on Windows are invisible to PyTorch and the pipeline would normally
+# fall back to CPU-only.  With the Hybrid strategy, if you manage to install
+# a custom ROCm build (or if PyTorch ever adds support), the manager will
+# detect the AMD GPU, see it has limited VRAM, and automatically use the
+# GPU for diffusion while keeping the RAM-hungry mesh extraction on the CPU.
+# =============================================================================
+class SmartDeviceManager:
+    """
+    Auto-detects hardware and picks the safest, fastest strategy.
+
+    You do NOT need to touch this class.  The pipeline uses it automatically.
+    Advanced users can force a strategy by passing:
+        device="cuda", strategy="hybrid"
+    when creating the pipeline.
+    """
+
+    def __init__(self, device: Optional[Union[str, torch.device]] = None,
+                 strategy: Optional[str] = None):
+        self.strategy = strategy  # "gpu", "hybrid", "cpu", or None (auto)
+        self.device = None
+        self.vae_device = None
+        self.vram_gb = 0.0
+        self.is_amd_windows = False
+
+        # ------------------------------------------------------------------
+        # Step 1 – Detect what PyTorch can see
+        # ------------------------------------------------------------------
+        if device is not None:
+            # User forced a specific torch device
+            self.device = torch.device(device)
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+
+        # ------------------------------------------------------------------
+        # Step 2 – Measure VRAM (only works for CUDA/ROCm/MPS)
+        # ------------------------------------------------------------------
+        if self.device.type == "cuda":
+            try:
+                props = torch.cuda.get_device_properties(self.device)
+                self.vram_gb = props.total_memory / (1024 ** 3)
+                # Heuristic: AMD cards on Linux report "cuda" too when ROCm
+                # is installed.  On Windows they usually do not appear at all.
+                if "AMD" in props.name or "Radeon" in props.name:
+                    self.is_amd_windows = sys.platform == "win32"
+            except Exception:
+                self.vram_gb = 0.0
+        elif self.device.type == "mps":
+            # Apple Silicon – shared memory, treat like low-VRAM GPU
+            try:
+                import psutil
+                self.vram_gb = psutil.virtual_memory().total / (1024 ** 3)
+            except Exception:
+                self.vram_gb = 8.0
+
+        # ------------------------------------------------------------------
+        # Step 3 – Pick strategy if the user did not force one
+        # ------------------------------------------------------------------
+        if self.strategy is None:
+            if self.device.type == "cpu":
+                self.strategy = "cpu"
+            elif self.vram_gb >= 8.0 and not self.is_amd_windows:
+                # Dedicated NVIDIA / AMD-dGPU with plenty of VRAM
+                self.strategy = "gpu"
+            else:
+                # Low-VRAM GPU, integrated AMD, Apple MPS, or AMD on Windows
+                self.strategy = "hybrid"
+
+        # ------------------------------------------------------------------
+        # Step 4 – Decide where the VAE (mesh extraction) lives
+        # ------------------------------------------------------------------
+        # In "hybrid" mode we keep the diffusion model on the GPU but move
+        # the VAE to the CPU for mesh extraction.  This is the secret sauce
+        # that lets 4-6 GB cards survive the octree decode.
+        if self.strategy == "hybrid":
+            self.vae_device = torch.device("cpu")
+        else:
+            self.vae_device = self.device
+
+        logger.info(
+            f"[SmartDevice] Detected {self.device.type.upper()} "
+            f"({self.vram_gb:.1f} GB VRAM / shared RAM). "
+            f"Strategy: {self.strategy.upper()}. "
+            f"Diffusion on {self.device}, VAE on {self.vae_device}."
+        )
+
+    def get_safe_export_params(self, user_octree=None, user_chunks=None):
+        """
+        Return conservative octree_resolution / num_chunks when running on
+        CPU or in hybrid mode.  Prevents Windows from silently killing the
+        process when RAM runs out.
+
+        The user can still override these from Modly nodes – this is only
+        the safety net when nothing is specified.
+        """
+        if self.strategy == "gpu" and self.vram_gb >= 8:
+            # Powerful GPU – generous defaults
+            return user_octree or 256, user_chunks or 4000
+
+        # CPU or Hybrid – we are RAM-limited
+        try:
+            import psutil
+            ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        except Exception:
+            ram_gb = 16.0  # guess
+
+        if ram_gb < 12:
+            octree = 128
+            chunks = 1000
+        elif ram_gb < 24:
+            octree = 192
+            chunks = 2000
+        else:
+            octree = 256
+            chunks = 4000
+
+        return user_octree or octree, user_chunks or chunks
 
 
 # =============================================================================
@@ -123,8 +276,9 @@ if _DISABLE_COMPILE:
 # =============================================================================
 # [COMMUNITY] VRAM Cleanup Helper
 # =============================================================================
-# Small helper used by the manual-offload path.  Calling gc.collect() before
-# empty_cache() ensures that orphaned CUDA tensors are freed immediately.
+# Small helper used by the manual-offload and hybrid paths.  Calling
+# gc.collect() before empty_cache() ensures that orphaned CUDA tensors are
+# freed immediately.
 # =============================================================================
 def free_vram():
     """Free residual GPU memory to prevent hangs on laptops and AMD cards."""
@@ -242,9 +396,10 @@ class Hunyuan3DDiTPipeline:
     Base pipeline for Hunyuan3D shape generation.
 
     This class has been community-optimised for:
-      - Low-VRAM GPUs (manual sequential offload)
+      - Low-VRAM GPUs (manual sequential offload + hybrid mode)
       - CPU inference (thread optimisation, progress silencing)
       - Windows / AMD stability (safe compile disabling)
+      - Automatic hardware detection (SmartDeviceManager)
     """
 
     model_cpu_offload_seq = "conditioner->model->vae"
@@ -259,6 +414,7 @@ class Hunyuan3DDiTPipeline:
         device='cuda',
         dtype=torch.float16,
         use_safetensors=None,
+        strategy=None,          # [COMMUNITY] "gpu", "hybrid", "cpu", or None
         **kwargs,
     ):
         # load config
@@ -304,6 +460,7 @@ class Hunyuan3DDiTPipeline:
             image_processor=image_processor,
             device=device,
             dtype=dtype,
+            strategy=strategy,
         )
         model_kwargs.update(kwargs)
 
@@ -318,6 +475,7 @@ class Hunyuan3DDiTPipeline:
         use_safetensors=False,   # 2.1 ships .ckpt by default
         variant='fp16',
         subfolder='hunyuan3d-dit-v2-1',
+        strategy=None,
         **kwargs,
     ):
         kwargs['from_pretrained_kwargs'] = dict(
@@ -340,6 +498,7 @@ class Hunyuan3DDiTPipeline:
             device=device,
             dtype=dtype,
             use_safetensors=use_safetensors,
+            strategy=strategy,
             **kwargs
         )
 
@@ -352,6 +511,7 @@ class Hunyuan3DDiTPipeline:
         image_processor,
         device='cuda',
         dtype=torch.float16,
+        strategy=None,
         **kwargs
     ):
         self.vae = vae
@@ -360,6 +520,21 @@ class Hunyuan3DDiTPipeline:
         self.conditioner = conditioner
         self.image_processor = image_processor
         self.kwargs = kwargs
+
+        # =================================================================
+        # [COMMUNITY] Smart Device Manager
+        # =================================================================
+        # Instead of blindly putting everything on "cuda" or "cpu", we ask
+        # the SmartDeviceManager to inspect the machine and decide.
+        # The manager stores:
+        #   - self._device_mgr.device      : where the diffusion model lives
+        #   - self._device_mgr.vae_device  : where the VAE lives (can be CPU)
+        #   - self._device_mgr.strategy    : "gpu", "hybrid", or "cpu"
+        # =================================================================
+        self._device_mgr = SmartDeviceManager(device=device, strategy=strategy)
+        self.device = self._device_mgr.device
+        self.vae_device = self._device_mgr.vae_device
+        self.strategy = self._device_mgr.strategy
 
         # =================================================================
         # [COMMUNITY] Manual sequential offload flag
@@ -371,7 +546,7 @@ class Hunyuan3DDiTPipeline:
         # =================================================================
         self.manual_offload = False
 
-        self.to(device, dtype)
+        self.to(self.device, dtype)
 
         # =================================================================
         # [COMMUNITY] Optional torch.compile() on model
@@ -415,9 +590,15 @@ class Hunyuan3DDiTPipeline:
             self.conditioner.to(dtype=dtype)
         if device is not None:
             self.device = torch.device(device)
-            self.vae.to(device)
-            self.model.to(device)
-            self.conditioner.to(device)
+            # In hybrid mode the VAE starts on CPU even if device is GPU
+            if self.strategy == "hybrid":
+                self.model.to(self.device)
+                self.conditioner.to(self.device)
+                self.vae.to(self.vae_device)
+            else:
+                self.vae.to(device)
+                self.model.to(device)
+                self.conditioner.to(device)
 
     @property
     def _execution_device(self):
@@ -533,7 +714,27 @@ class Hunyuan3DDiTPipeline:
             un_cond = self.conditioner.unconditional_embedding(bsz, **additional_cond_inputs)
 
             if dual_guidance:
-                un_cond_drop_main = copy.deepcopy(un_cond)
+                # =========================================================
+                # [COMMUNITY] RAM spike fix – removed copy.deepcopy()
+                # =========================================================
+                # The original code did:
+                #     un_cond_drop_main = copy.deepcopy(un_cond)
+                # deepcopy() creates a FULL duplicate of every tensor in the
+                # dict.  On CPU that can instantly consume 2-4 GB of RAM.
+                #
+                # We only need to change the 'additional' key, so we build a
+                # new dict with shallow copies (shared tensor references).
+                # This is safe because we never modify the tensors themselves,
+                # only which dict points to which tensor.
+                # =========================================================
+                un_cond_drop_main = {}
+                for k, v in un_cond.items():
+                    if isinstance(v, torch.Tensor):
+                        un_cond_drop_main[k] = v
+                    elif isinstance(v, dict):
+                        un_cond_drop_main[k] = {kk: vv for kk, vv in v.items()}
+                    else:
+                        un_cond_drop_main[k] = v
                 un_cond_drop_main['additional'] = cond['additional']
 
                 def cat_recursive(a, b, c):
@@ -708,7 +909,7 @@ class Hunyuan3DDiTPipeline:
 
         # [COMMUNITY] Manual offload: bring diffusion model to GPU
         if getattr(self, "manual_offload", False):
-            self.model.to(device)
+            self.model.to(self.device)
 
         with synchronize_timer('Diffusion Sampling'):
             for i, t in enumerate(tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:", leave=False)):
@@ -746,10 +947,22 @@ class Hunyuan3DDiTPipeline:
             self.model.to("cpu")
             free_vram()
 
+        # =================================================================
+        # [COMMUNITY] Auto-detect safe mesh-extraction params
+        # =================================================================
+        # The Modly node system can override octree_resolution and num_chunks.
+        # If the user leaves them at default (or passes None), the Smart
+        # Device Manager steps in and picks values that will NOT kill a
+        # 16 GB laptop.
+        # =================================================================
+        safe_octree, safe_chunks = self._device_mgr.get_safe_export_params(
+            octree_resolution, num_chunks
+        )
+
         return self._export(
             latents,
             output_type,
-            box_v, mc_level, num_chunks, octree_resolution, mc_algo,
+            box_v, mc_level, safe_chunks, safe_octree, mc_algo,
         )
 
     def _export(
@@ -764,25 +977,48 @@ class Hunyuan3DDiTPipeline:
         enable_pbar=True
     ):
         if not output_type == "latent":
-            # [COMMUNITY] Manual offload: bring VAE to GPU for decode
-            if getattr(self, "manual_offload", False):
-                self.vae.to(self.device)
+            # =================================================================
+            # [COMMUNITY] Hybrid mode: move VAE to the right device
+            # =================================================================
+            # In "hybrid" strategy the diffusion model stays on GPU but the
+            # VAE is moved to CPU before mesh extraction.  This prevents the
+            # GPU from running out of VRAM during the octree decode.
+            # =================================================================
+            target_device = self.vae_device if self.strategy == "hybrid" else self.device
+            self.vae.to(target_device)
+            latents = latents.to(target_device)
+
+            # =================================================================
+            # [COMMUNITY] Aggressive RAM cleanup before the heaviest operation
+            # =================================================================
+            # The diffusion phase may have left large temporary tensors in
+            # memory.  We force Python to collect garbage NOW so those
+            # tensors disappear before the VAE decode starts asking for
+            # hundreds of megabytes (or gigabytes) of fresh RAM.
+            # =================================================================
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # =================================================================
             # [COMMUNITY] CPU-optimised mesh extraction
             # =================================================================
             # When running on CPU we:
             #   1. Silence tqdm to avoid console spam on slow machines
-            #   2. Temporarily raise thread count to ALL cores for the decode
+            #   2. Use safe_cores (not total_cores) to leave RAM headroom
             #   3. Measure and log elapsed time so users know it is working
             #   4. Restore the original thread count afterwards
             # =================================================================
-            is_cpu = str(self.device) == 'cpu'
+            is_cpu = str(target_device) == 'cpu'
             if is_cpu:
                 import time
                 actual_enable_pbar = False
                 original_threads = torch.get_num_threads()
-                torch.set_num_threads(total_cores)
+                # Use safe_cores instead of total_cores.  Each PyTorch thread
+                # allocates its own workspace buffers; fewer threads = less
+                # peak RAM and a happier Windows Task Manager.
+                mesh_threads = max(1, safe_cores - 1)
+                torch.set_num_threads(mesh_threads)
                 logger.info(
                     f"[CPU EXPORT] Mesh extraction: octree={octree_resolution}, "
                     f"chunks={num_chunks}, threads={torch.get_num_threads()}. "
@@ -829,7 +1065,8 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
     """
     Flow-matching variant used by Hunyuan3D-2.1.
 
-    Same community optimisations apply (manual offload, CPU decode, etc.).
+    Same community optimisations apply (manual offload, CPU decode, hybrid
+    mode, SmartDeviceManager, etc.).
     """
 
     @torch.inference_mode()
@@ -893,7 +1130,7 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
 
         # [COMMUNITY] Manual offload: bring model to GPU
         if getattr(self, "manual_offload", False):
-            self.model.to(device)
+            self.model.to(self.device)
 
         with synchronize_timer('Diffusion Sampling'):
             for i, t in enumerate(tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:")):
@@ -923,9 +1160,16 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
             self.model.to("cpu")
             free_vram()
 
+        # =================================================================
+        # [COMMUNITY] Auto-detect safe mesh-extraction params
+        # =================================================================
+        safe_octree, safe_chunks = self._device_mgr.get_safe_export_params(
+            octree_resolution, num_chunks
+        )
+
         return self._export(
             latents,
             output_type,
-            box_v, mc_level, num_chunks, octree_resolution, mc_algo,
+            box_v, mc_level, safe_chunks, safe_octree, mc_algo,
             enable_pbar=enable_pbar,
         )
