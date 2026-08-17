@@ -2,7 +2,7 @@
 Hunyuan3D 2.1 Generator for Modly -- Community-optimised for AMD / low-VRAM
 
 Model source : tencent/Hunyuan3D-2.1 (HuggingFace)
-Code source  : https://github.com/PESZzzz/Estoy-cayendo-en-la-locura
+Code source  : https://github.com/PESZzzz/PESZzzz-modly-hunyuan3d-2.1
 
 This extension uses Modly's per-node download system:
   - "Generate Mesh" node : downloads only the shape model (hunyuan3d-dit-v2-1)
