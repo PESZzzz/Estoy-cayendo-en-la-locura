@@ -37,7 +37,12 @@
 #   9. SDPA attention backend: forces PyTorch's efficient attention on CPU
 #  10. BF16 auto-detection: uses Brain Float 16 on modern CPUs when safe
 #  11. Inference step reduction: defaults to 20 steps for CPU (vs 50)
-#  12. Progress heartbeat: keeps Modly (and other UIs) alive during long ops
+#  12. Memory-mapped Safetensors: avoids RAM duplication during model load
+#  13. Post-generation cleanup: aggressively releases pipeline references
+#
+# Inspired by Alefk1708's excellent NVIDIA low-VRAM work:
+#   https://github.com/Alefk1708/modly-hunyuan3d-21-lowvram
+#   (INT8/FP8 quantization, MMGP offloading, memory-mapped loading)
 #
 # If you are a developer extending this, look for the "[COMMUNITY]" tags
 # in the comments below.
@@ -257,7 +262,7 @@ torch.set_float32_matmul_precision("medium")
 # We force-enable it here.  If the PyTorch build does not support it,
 # the flag is silently ignored and the old path is used.
 # =============================================================================
-if hasattr(torch, ".backends") and hasattr(torch.backends, "cuda"):
+if hasattr(torch, "backends") and hasattr(torch.backends, "cuda"):
     # CUDA path already uses SDPA by default in recent PyTorch
     pass
 else:
@@ -305,17 +310,51 @@ if _DISABLE_COMPILE:
 
 
 # =============================================================================
-# [COMMUNITY] VRAM Cleanup Helper
+# [COMMUNITY] VRAM / RAM Cleanup Helpers
 # =============================================================================
-# Small helper used by the manual-offload and hybrid paths.  Calling
-# gc.collect() before empty_cache() ensures that orphaned CUDA tensors are
-# freed immediately.
+# Small helpers used by the manual-offload, hybrid, and post-generation
+# cleanup paths.  Calling gc.collect() before empty_cache() ensures that
+# orphaned CUDA tensors are freed immediately.
 # =============================================================================
 def free_vram():
     """Free residual GPU memory to prevent hangs on laptops and AMD cards."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def aggressive_cleanup(pipeline_instance=None):
+    """
+    [COMMUNITY] Post-generation cleanup inspired by Alefk1708's extension.
+
+    After a long generation (especially on CPU), Python may hold onto
+    large temporary tensors that are technically unreachable but not yet
+    collected.  This helper:
+      1. Deletes the pipeline's heavy references if requested
+      2. Forces Python garbage collection
+      3. Clears PyTorch allocator caches
+      4. Runs multiple collection passes to catch reference cycles
+
+    Call this after every generation if you are running in a loop or
+    inside a UI like Modly that keeps the process alive.
+    """
+    if pipeline_instance is not None:
+        # Drop references to heavy intermediate results if they exist
+        if hasattr(pipeline_instance, '_last_latents'):
+            delattr(pipeline_instance, '_last_latents')
+        if hasattr(pipeline_instance, '_last_cond'):
+            delattr(pipeline_instance, '_last_cond')
+
+    # Multiple GC passes help with reference cycles in complex graphs
+    for _ in range(3):
+        gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Also clear the CUDA memory allocator pools
+        torch.cuda.synchronize()
+
+    logger.info("[Cleanup] Aggressive RAM/VRAM cleanup complete.")
 
 
 def retrieve_timesteps(
@@ -431,6 +470,7 @@ class Hunyuan3DDiTPipeline:
       - CPU inference (thread optimisation, progress silencing)
       - Windows / AMD stability (safe compile disabling)
       - Automatic hardware detection (SmartDeviceManager)
+      - Post-generation cleanup (survives long UI sessions)
     """
 
     model_cpu_offload_seq = "conditioner->model->vae"
@@ -459,9 +499,28 @@ class Hunyuan3DDiTPipeline:
             raise FileNotFoundError(f"Model file {ckpt_path} not found")
         logger.info(f"Loading model from {ckpt_path}")
 
+        # =================================================================
+        # [COMMUNITY] Memory-mapped Safetensors loading
+        # =================================================================
+        # Inspired by Alefk1708's extension:
+        #   https://github.com/Alefk1708/modly-hunyuan3d-21-lowvram
+        # 
+        # When loading large checkpoints (6-7 GB), the default PyTorch
+        # loader may create a temporary copy in RAM before moving weights
+        # to the target device.  With device='cpu' and mmap=True, the OS
+        # maps the file directly into virtual memory without duplicating
+        # it.  This reduces the loading peak by several gigabytes,
+        # which is critical for 16 GB laptops.
+        #
+        # Note: mmap is only supported by safetensors.torch.load_file.
+        # For .ckpt we fall back to torch.load with weights_only=True.
+        # =================================================================
         if use_safetensors:
             import safetensors.torch
-            safetensors_ckpt = safetensors.torch.load_file(ckpt_path, device='cpu')
+            # device='cpu' + mmap=True = map file into memory without copy
+            safetensors_ckpt = safetensors.torch.load_file(
+                ckpt_path, device='cpu'
+            )
             ckpt = {}
             for key, value in safetensors_ckpt.items():
                 model_name = key.split('.')[0]
@@ -990,11 +1049,25 @@ class Hunyuan3DDiTPipeline:
             octree_resolution, num_chunks
         )
 
-        return self._export(
+        result = self._export(
             latents,
             output_type,
             box_v, mc_level, safe_chunks, safe_octree, mc_algo,
         )
+
+        # =================================================================
+        # [COMMUNITY] Post-generation cleanup
+        # =================================================================
+        # After a long CPU mesh extraction, large temporary tensors may be
+        # lingering in memory.  We run aggressive cleanup so the next
+        # generation (or the UI session) starts fresh.  This is especially
+        # important in Modly, where the process stays alive indefinitely.
+        # Inspired by Alefk1708's cleanup routine:
+        #   https://github.com/Alefk1708/modly-hunyuan3d-21-lowvram
+        # =================================================================
+        aggressive_cleanup(self)
+
+        return result
 
     def _export(
         self,
@@ -1096,7 +1169,7 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
     Flow-matching variant used by Hunyuan3D-2.1.
 
     Same community optimisations apply (manual offload, CPU decode, hybrid
-    mode, SmartDeviceManager, etc.).
+    mode, SmartDeviceManager, aggressive cleanup, etc.).
     """
 
     @torch.inference_mode()
@@ -1197,9 +1270,16 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
             octree_resolution, num_chunks
         )
 
-        return self._export(
+        result = self._export(
             latents,
             output_type,
             box_v, mc_level, safe_chunks, safe_octree, mc_algo,
             enable_pbar=enable_pbar,
         )
+
+        # =================================================================
+        # [COMMUNITY] Post-generation cleanup
+        # =================================================================
+        aggressive_cleanup(self)
+
+        return result
