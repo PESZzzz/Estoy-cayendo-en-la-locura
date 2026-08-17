@@ -40,6 +40,10 @@
 #  12. Memory-mapped Safetensors: avoids RAM duplication during model load
 #  13. Post-generation cleanup: aggressively releases pipeline references
 #
+# Inspired by Alefk1708's excellent NVIDIA low-VRAM work:
+#   https://github.com/Alefk1708/modly-hunyuan3d-21-lowvram
+#   (INT8/FP8 quantization, MMGP offloading, memory-mapped loading)
+#
 # If you are a developer extending this, look for the "[COMMUNITY]" tags
 # in the comments below.
 # ============================================================================
