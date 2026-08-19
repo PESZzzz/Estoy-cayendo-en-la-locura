@@ -1,4 +1,4 @@
-## For big brain programmers
+## For *Big Brain* Programmers
 
 If you're a real programmer, not like me. Here you'll find the things you want to know:
 
