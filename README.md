@@ -1,5 +1,7 @@
 # PESZzzz-modly-hunyuan3d-2.1 :D!
 
+[English](README.md) | **Español**
+
 ## What is this?
 
 Practically, a Modly extension for Hunyuan3D 2.1 designed for Windows AMD users and modest laptops or PCs.
