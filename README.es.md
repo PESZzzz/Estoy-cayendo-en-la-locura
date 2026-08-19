@@ -6,7 +6,7 @@
 
 Prácticamente, una extensión de Modly para Hunyuan3D 2.1 diseñada para usuarios de AMD en Windows y laptops o PCs modestas.
 
-Reemplaza y parchea el código interno de Hunyuan3D 2.1 para ejecutarlo en hardware para el cual Tencent nunca optimizó[cite: 3].
+Reemplaza y parchea el código interno de Hunyuan3D 2.1 para ejecutarlo en hardware para el cual Tencent nunca optimizó.
 
 Como dije, esto está diseñado para Modly. **NO** es un script independiente. Pero, hey, toda la estructura dentro de la carpeta `hy3dshape` contiene los parches. Si quieres meterlo a ComfyUI o a tu propia herramienta, ¡adelante! (No recomiendo ComfyUI para nada, especialmente para AMD).
 
