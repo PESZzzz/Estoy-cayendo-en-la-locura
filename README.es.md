@@ -6,11 +6,11 @@
 
 Prácticamente, una extensión de Modly para Hunyuan3D 2.1 diseñada para usuarios de AMD en Windows y laptops o PCs modestas.
 
-Reemplaza y parcha el código interno de Hunyuan3D 2.1 para ejecutarlo en hardware para el cual Tencent nunca optimizó[cite: 3].
+Reemplaza y parchea el código interno de Hunyuan3D 2.1 para ejecutarlo en hardware para el cual Tencent nunca optimizó[cite: 3].
 
-Como dije, esto está diseñado para Modly. **NO** es un script independiente. Pero, hey, toda la estructura dentro de la carpeta `hy3dshape` contiene los parches. Si quieres conectarlo a ComfyUI o a tu propia herramienta, ¡adelante! (Igual no recomiendo ComfyUI para nada, especialmente para AMD).
+Como dije, esto está diseñado para Modly. **NO** es un script independiente. Pero, hey, toda la estructura dentro de la carpeta `hy3dshape` contiene los parches. Si quieres meterlo a ComfyUI o a tu propia herramienta, ¡adelante! (No recomiendo ComfyUI para nada, especialmente para AMD).
 
-En las pruebas demostró que funciona en varias computadoras, incluso con NVIDIA. Aunque también puede *explotar*, así que... cuidado (take care).
+En las pruebas demostró que funciona en varias computadoras, incluso con NVIDIA. Aunque también puede *explotar*, así que... ten cuidado.
 
 Oye, ¿sigues aquí? Genial, ¡eso significa que sabes leer :D!
 
@@ -20,7 +20,7 @@ Oye, ¿sigues aquí? Genial, ¡eso significa que sabes leer :D!
 
 Sinceramente, *no* me acuerdo. **NO** soy programador :D! Solo... usé IA.
 
-Pero no te preocupes, encontrarás todas las explicaciones y cambios justo aquí:  
+Pero no te preocupes, encontrarás todas las explicaciones y cambios justo aquí (en inglés):  
 👉 **[Lee el desglose técnico (summary.md)](summary.md)**
 
 Los archivos principales parchados son estos:
@@ -32,7 +32,7 @@ Los archivos principales parchados son estos:
 
 ## Requisitos
 
-Llegó la *MEJOR* parte:
+La *MEJOR* parte:
 
 | Componente   | Mínimo                | Recomendado               |
 | ------------ | --------------------- | ------------------------- |
@@ -43,7 +43,7 @@ Llegó la *MEJOR* parte:
 | **Espacio**  | 15 GB libres          | 20 GB libres              |
 | **Modly**    | Última versión estable| Última versión estable    |
 
-> 📌 **Nota:** Esta extensión fue hecha pensando en usuarios de **AMD**. Si tienes una **GPU NVIDIA**, tal vez prefieras la extensión de AlefK1708: [modly-hunyuan3d-21-lowvram](https://github.com/Alefk1708/modly-hunyuan3d-21-lowvram).
+> 📌 **Nota:** Esta extensión fue hecha para usuarios de **AMD**. Si tienes una **GPU NVIDIA**, opta por la extensión de AlefK1708: [modly-hunyuan3d-21-lowvram](https://github.com/Alefk1708/modly-hunyuan3d-21-lowvram).
 
 ---
 
@@ -70,19 +70,19 @@ Llegó la *MEJOR* parte:
 
 ## Uso en Modly
 
-### Parámetros Recomendados
+### Parámetros
 
 | Parámetro            | Rápido      | Balanceado | Alta Calidad |
 | -------------------- | ----------- | ---------- | ------------ |
-| **Quality**          | 15 pasos    | 30 pasos   | 50 pasos     |
+| **Quality**          | 15 steps    | 30 steps   | 50 steps     |
 | **Mesh Resolution**  | 256         | 384        | 512          |
 | **Guidance Scale**   | \-          | Cualquier escala | \-     |
 | **Max Vertices**     | \-          | Depende del modelo | \-   |
 
 **En más detalle:**
-- **Quality (Calidad):** Determina los pasos de difusión.
-- **Mesh Resolution (Resolución de Malla):** 256 es seguro para 16 GB de RAM. 384+ requiere más RAM / VRAM.
-- **Guidance Scale:** Qué tan fielmente sigue la malla a la imagen de entrada.
+- **Quality:** Determina los steps de difusión.
+- **Mesh Resolution:** 256 es seguro para 16 GB de RAM. 384+ requiere más RAM / VRAM.
+- **Guidance Scale:** Qué tan fielmente sigue el mesh a la imagen.
 - **Max Vertices:** Reduce la cantidad de polígonos al límite que le pongas.
 - **Seed (Semilla):** Déjala en `-1` para que sea aleatoria. Cámbiala solo si sabes lo que haces.
 
@@ -91,7 +91,7 @@ Llegó la *MEJOR* parte:
 ## ¡¡¡IMPORTANTE!!!
 
 1. **La generación es muy lenta en CPU.**  
-   ¿Qué esperabas? En una laptop de 8 núcleos usando 30 pasos, puede tardar de 4 a 5 horas o más. Te recomiendo *MUCHO* usar 15 pasos y una resolución de malla baja para vistas previas rápidas.
+   ¿Qué esperabas? En una laptop de 8 núcleos usando 30 steps, puede tardar de 4 a 5 horas o más. Te recomiendo *MUCHO* usar 15 pasos y un Mesh Resolution bajo para vistas previas.
 
 2. **Cierra TODAS las aplicaciones que tengas abiertas.**  
    Los primeros minutos de carga consumen un montón de RAM. Conforme pasa el tiempo después de cargar, se estabiliza. ¡Hasta puedes ver videos en YouTube mientras esperas!
@@ -101,7 +101,7 @@ Llegó la *MEJOR* parte:
 
 ---
 
-Finalmente, este proyecto tomó muchísimo trabajo. No soy programador; solo soy otro estudiante con una laptop normal, sin experiencia ni dinero. Todas estas ideas de optimización, como la "Estrategia Híbrida", las hice yo, no la IA. Esto fue toda una experiencia de aprendizaje para mí y aprendí un montón durante el proceso.
+Para terminar, este proyecto tomó muchísimo trabajo. No soy programador; solo soy otro estudiante con una laptop normal, sin experiencia ni dinero. Todas estas ideas de optimización, como la "Estrategia Híbrida", las hice yo, no la IA. Esto fue toda una experiencia de aprendizaje para mí y aprendí un montón durante el proceso.
 
 Si quieres apoyarme, puedes invitarme a un café en Ko-fi:  
 ☕ **[https://ko-fi.com/peszs](https://ko-fi.com/peszs)**
