@@ -1,6 +1,6 @@
 # PESZzzz-modly-hunyuan3d-2.1 :D!
 
-[English](README.md) | **Español**
+**English** | [Español](README.es.md)
 
 ## What is this?
 
