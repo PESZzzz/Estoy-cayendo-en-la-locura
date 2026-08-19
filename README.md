@@ -1,4 +1,4 @@
-# PESZzzz-modly-hunyuan3d-2.1 :D!
+# PESZzzz-Modly-hunyuan3d-2.1
 
 **English** | [Español](README.es.md)
 
